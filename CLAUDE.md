@@ -56,7 +56,7 @@ is needed for Compose. Implemented so far:
   `buildNotification()` before `sessionStartMs` is set, and keep the
   zero-metric fallback that adds a `FixedText` status metric).
 
-Not yet implemented: session logging (Room/CSV) and the Glance widget.
+Not yet implemented: session logging (Room/CSV).
 
 **Verified on the Pixel 6a (2026-08-24):** connect, GATT `refresh()` cache
 workaround, service discovery, HR notification subscription, live BPM in the
@@ -73,8 +73,6 @@ A native Android app that reads the **live BLE heart rate stream** from a Google
 Fitbit Air and surfaces it on the **lock screen / Always-On Display** as an
 Android Live Update, so the number is readable at a glance without unlocking the
 phone.
-
-Secondary surface: a home-screen widget fed by the same service.
 
 The Air is screenless, so the tracker itself can never show a live reading. This
 app is the display.
@@ -271,7 +269,6 @@ BleHeartRateService (foreground service)
   └─ owns BluetoothGatt connection + reconnect loop
   └─ emits HeartRateSample(bpm, timestampMs) on a StateFlow
        ├─> LiveUpdateNotifier   (primary surface)
-       ├─> GlanceWidget         (secondary surface)
        └─> SessionRepository    (Room, 1 Hz)
 ```
 
@@ -400,19 +397,6 @@ Update in place with the same notification ID at ~1 Hz. Do not re-post.
 
 ---
 
-## Widget (secondary surface)
-
-Jetpack Glance, updated from the same service.
-
-The 30-minute floor applies only to system-driven `updatePeriodMillis`
-refreshes. Our service can call `AppWidgetManager.updateAppWidget` as often as
-we like. Throttle to 1 Hz **and only on change** — each update is cross-process
-IPC to the launcher and some third-party launchers get janky.
-
-The widget must honour the same staleness rules.
-
----
-
 ## Session logging
 
 Room database, one row per sample: `timestampMs`, `bpm`, `sessionId`.
@@ -492,7 +476,6 @@ app source/target compatibility is Java 11 (`app/build.gradle.kts`).
 ```
 androidx.core:core-ktx            >= 1.17.0   // setRequestPromotedOngoing
 androidx.compose (BOM)                        // in-app UI
-androidx.glance:glance-appwidget              // home-screen widget
 androidx.room:room-runtime + room-ktx         // session storage
 kotlinx-coroutines-android
 ```
@@ -508,9 +491,9 @@ escape hatch. Raise it as a suggestion first; do not swap it in unprompted.
 
 ### Not cross-platform
 
-Do not propose React Native, Flutter, or KMP. Live Updates and Glance widgets
-have no cross-platform equivalent — the most interesting parts of this app would
-be native Kotlin anyway, plus a bridge. Native-only is strictly less work here.
+Do not propose React Native, Flutter, or KMP. Live Updates have no
+cross-platform equivalent — the most interesting part of this app would be
+native Kotlin anyway, plus a bridge. Native-only is strictly less work here.
 
 ### Distribution
 
@@ -527,7 +510,7 @@ Do not add release signing, Play Console metadata, crash reporting, or analytics
 
 ## Style
 
-- Kotlin, Jetpack Compose for in-app UI, Glance for the widget
+- Kotlin, Jetpack Compose for in-app UI
 - Coroutines + Flow; no RxJava, no callbacks past the GATT boundary
 - The GATT callback thread is not the main thread — dispatch accordingly
 - Keep BLE logic in one class with no Android UI imports so it is unit-testable
@@ -537,11 +520,16 @@ Do not add release signing, Play Console metadata, crash reporting, or analytics
 
 ## Definition of done for v1
 
-- [ ] Discovers the Air without a hardcoded MAC
-- [ ] Recovers from the stale GATT cache automatically
-- [ ] Subscribes to `0x2A37` and parses the flags byte correctly
-- [ ] Foreground service survives screen-off for a 60-minute session
-- [ ] Live Update readable on the lock screen without unlocking
-- [ ] Stale readings visibly degrade within 5 seconds
-- [ ] Reconnects automatically after walking out of range and back
-- [ ] Google Health still syncs normally throughout
+- [x] Discovers the Air without a hardcoded MAC
+- [x] Recovers from the stale GATT cache automatically
+- [x] Subscribes to `0x2A37` and parses the flags byte correctly
+- [ ] Foreground service survives screen-off for a 60-minute session — only
+      multi-minute sessions run so far, not a full hour
+- [x] Live Update readable on the lock screen without unlocking
+- [ ] Stale readings visibly degrade within 5 seconds — done in the in-app
+      Compose UI; the notification/Live Update surface has no staleness
+      check yet and will show a frozen BPM indefinitely if the stream stalls
+- [ ] Reconnects automatically after walking out of range and back — backoff
+      logic is implemented but has never actually been triggered/observed on
+      hardware
+- [x] Google Health still syncs normally throughout
