@@ -19,13 +19,44 @@ is needed for Compose. Implemented so far:
   discovery (bonded-device match, scan fallback), GATT cache `refresh()`
   reflection call before discovery, Service Changed (0x1801/0x2A05)
   resubscription, HR measurement flags-byte parsing, event-driven reconnect
-  with the documented backoff schedule and 30s unrecoverable cutoff, and a
-  plain ongoing notification (tier 3 only — Live Update promotion is not
-  wired up yet).
+  with the documented backoff schedule and 30s unrecoverable cutoff.
+- `HeartRateZones` — Karvonen/Tanaka fractional zone calculation (pure,
+  unit-tested). `UserSettings` persists age/resting HR via SharedPreferences;
+  `MainActivity` shows a first-run setup screen that gates the main screen
+  until both are set, plus an edit affordance.
+- Notification: full 3-tier fallback implemented. Channel is
+  `heart_rate_session_v2` at `IMPORTANCE_DEFAULT` (the original
+  `heart_rate_session` channel was `IMPORTANCE_LOW`, which Android's newer
+  notification UI buckets into a collapsed "Silent" section that doesn't
+  reliably show on the lock screen — channel importance can't be changed
+  retroactively for an existing channel ID, hence the `_v2` rename; the old
+  channel is deleted on startup). `POST_PROMOTED_NOTIFICATIONS` is declared
+  in the manifest (protectionLevel `normal|appop`, user-toggleable at
+  Settings → Apps → [app] → Notifications → "Live updates", default-on once
+  declared — see "Hard requirements for promotion" below for the settings
+  intent). Both notification builders request promotion
+  (`setRequestPromotedOngoing(true)`, needs `androidx.core` ≥1.17.0) and set
+  `VISIBILITY_PUBLIC` — the whole point of this app is a glanceable number
+  without unlocking, so redacted lock-screen content defeats the purpose.
+  On `CINNAMON_BUN` (API 37 / Android 17) with
+  `NotificationManager.canPostPromotedNotifications() == true`, a native
+  `android.app.Notification.Builder` + `Notification.MetricStyle` renders
+  BPM (critical metric), zone, and elapsed (`Metric.TimeDifference`
+  chronometer, ticks natively without our involvement) directly on the lock
+  screen and AOD — confirmed by the OS itself, not just requested:
+  `flags` includes `PROMOTED_ONGOING` and `template` reads
+  `android.app.Notification$MetricStyle` in `dumpsys notification`. Below
+  that tier it falls back to a promoted `NotificationCompat` builder, and
+  below that (promotion declined) a plain public/default-importance ongoing
+  notification — all three are exercised by the same code path, gated on
+  `Build.VERSION.SDK_INT` and the live capability check, not a device
+  allowlist.
+  `Notification.MetricStyle` throws if it has zero metrics — guard any
+  future edit to the metric-adding logic (e.g. don't call
+  `buildNotification()` before `sessionStartMs` is set, and keep the
+  zero-metric fallback that adds a `FixedText` status metric).
 
-Not yet implemented: zone calculation, session logging (Room/CSV), the Glance
-widget, and Live Update / promoted-notification tiers. `age`/`restingHr`
-settings and first-run prompt don't exist yet either.
+Not yet implemented: session logging (Room/CSV) and the Glance widget.
 
 **Verified on the Pixel 6a (2026-08-24):** connect, GATT `refresh()` cache
 workaround, service discovery, HR notification subscription, live BPM in the
@@ -348,10 +379,19 @@ A notification will not be promoted unless all of these hold:
 - not a group summary (`setGroupSummary(false)`)
 - not colorized
 - channel importance is not `IMPORTANCE_MIN`
+- `android.permission.POST_PROMOTED_NOTIFICATIONS` declared in the manifest
+  (protectionLevel `normal|appop`; verified on-device — without it,
+  `canPostPromotedNotifications()` is permanently false and no per-app
+  toggle appears in system settings at all)
 
 Capability checks: `Notification.hasPromotableCharacteristics()`,
 `NotificationManager.canPostPromotedNotifications()`. To send the user to
-settings: `Settings.ACTION_MANAGE_APP_PROMOTED_NOTIFICATIONS`.
+settings: `Settings.ACTION_APP_NOTIFICATION_PROMOTION_SETTINGS` (with
+`Settings.EXTRA_APP_PACKAGE`) — verified on-device; this app's own doc draft
+had guessed the wrong constant name (`ACTION_MANAGE_APP_PROMOTED_NOTIFICATIONS`,
+which doesn't exist) before checking the actual `android.jar`. The user-facing
+toggle is labeled "Live updates" and defaults to on once the permission is
+declared.
 
 Request promotion via `NotificationCompat.Builder.setRequestPromotedOngoing(true)`
 (requires `androidx.core` 1.17.0+).

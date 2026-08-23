@@ -27,6 +27,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
@@ -73,6 +74,7 @@ class BleHeartRateService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private lateinit var notificationManager: NotificationManager
+    private val userSettings by lazy { UserSettings(this) }
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -89,6 +91,7 @@ class BleHeartRateService : Service() {
     private var reconnectJob: Job? = null
     private var firstDisconnectAtMs = 0L
     private var backoffIndex = 0
+    private var sessionStartMs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -106,8 +109,10 @@ class BleHeartRateService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                startForeground(NOTIFICATION_ID, buildNotification(null))
+                // Sets sessionStartMs synchronously so the first notification (built next)
+                // always has at least an elapsed-time metric to show.
                 startSession()
+                startForeground(NOTIFICATION_ID, buildNotification(null))
             }
             ACTION_STOP -> {
                 stopSession()
@@ -134,6 +139,7 @@ class BleHeartRateService : Service() {
             return
         }
         sessionActive = true
+        sessionStartMs = System.currentTimeMillis()
         _lastError.value = null
         firstDisconnectAtMs = 0L
         backoffIndex = 0
@@ -154,6 +160,7 @@ class BleHeartRateService : Service() {
     @SuppressLint("MissingPermission")
     private fun stopSession() {
         sessionActive = false
+        sessionStartMs = 0L
         reconnectJob?.cancel()
         reconnectJob = null
         currentGatt?.let { gatt ->
@@ -324,40 +331,129 @@ class BleHeartRateService : Service() {
     }
 
     // ---- Notification --------------------------------------------------------
+    //
+    // Tiered per CLAUDE.md: Metric Style Live Update (Android 17+, up to three
+    // metrics rendered on AOD/lock screen/status bar chip) > promoted ongoing
+    // notification (Android 16+, requested via compat but only honored on
+    // devices that support it) > plain ongoing notification (always works).
+    // Android will not retroactively raise an existing channel's importance,
+    // so this channel ID must change if IMPORTANCE_LOW was ever used before.
 
     private fun createNotificationChannel() {
+        notificationManager.deleteNotificationChannel(LEGACY_LOW_IMPORTANCE_CHANNEL_ID)
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Heart rate session",
-            NotificationManager.IMPORTANCE_LOW,
-        )
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            setSound(null, null)
+            enableVibration(false)
+        }
         notificationManager.createNotificationChannel(channel)
     }
 
     private fun buildNotification(sample: HeartRateSample?): Notification {
-        val text = when {
-            sample != null -> "${sample.bpm} bpm"
-            connectionState.value == ConnectionState.RECONNECTING -> "Reconnecting…"
-            connectionState.value == ConnectionState.SCANNING ||
-                connectionState.value == ConnectionState.CONNECTING ||
-                connectionState.value == ConnectionState.DISCOVERING -> "Connecting…"
-            else -> "Waiting for heart rate…"
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN &&
+            notificationManager.canPostPromotedNotifications()
+        ) {
+            buildMetricStyleNotification(sample)
+        } else {
+            buildCompatNotification(sample)
         }
-        val contentIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
+    }
+
+    private fun notificationContentText(sample: HeartRateSample?): String = when {
+        sample != null -> "${sample.bpm} bpm"
+        connectionState.value == ConnectionState.RECONNECTING -> "Reconnecting…"
+        connectionState.value == ConnectionState.SCANNING ||
+            connectionState.value == ConnectionState.CONNECTING ||
+            connectionState.value == ConnectionState.DISCOVERING -> "Connecting…"
+        else -> "Waiting for heart rate…"
+    }
+
+    private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun buildCompatNotification(sample: HeartRateSample?): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Fitbit Air heart rate")
-            .setContentText(text)
+            .setContentText(notificationContentText(sample))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(contentIntent)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(contentIntent())
             .setGroupSummary(false)
+            .setRequestPromotedOngoing(true)
+            .build()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.CINNAMON_BUN)
+    private fun buildMetricStyleNotification(sample: HeartRateSample?): Notification {
+        val zoneSettings = userSettings.load()
+        val zone = if (sample != null && zoneSettings != null) {
+            HeartRateZones.computeZone(sample.bpm, zoneSettings.age, zoneSettings.restingHr)
+        } else {
+            null
+        }
+
+        val style = Notification.MetricStyle()
+        var metricCount = 0
+        if (sample != null) {
+            style.addMetric(
+                Notification.Metric(
+                    Notification.Metric.FixedFloat(sample.bpm.toFloat(), "", 0, 0),
+                    "BPM",
+                ),
+            )
+            style.setCriticalMetric(0)
+            metricCount++
+        }
+        if (zone != null) {
+            style.addMetric(
+                Notification.Metric(
+                    Notification.Metric.FixedFloat(zone.toFloat(), "", 1, 1),
+                    "Zone",
+                ),
+            )
+            metricCount++
+        }
+        if (sessionStartMs > 0L) {
+            style.addMetric(
+                Notification.Metric(
+                    Notification.Metric.FixedText(formatElapsed(System.currentTimeMillis(), sessionStartMs)),
+                    "Elapsed",
+                ),
+            )
+            metricCount++
+        }
+        // Notification.MetricStyle throws if it ends up with zero metrics (e.g. the very
+        // first notification, before sessionStartMs/sample/zone are all available).
+        if (metricCount == 0) {
+            style.addMetric(
+                Notification.Metric(
+                    Notification.Metric.FixedText(notificationContentText(sample)),
+                    "Status",
+                ),
+            )
+        }
+
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Fitbit Air heart rate")
+            .setContentText(notificationContentText(sample))
+            .setStyle(style)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setContentIntent(contentIntent())
+            .setGroupSummary(false)
+            .setRequestPromotedOngoing(true)
             .build()
     }
 
@@ -374,7 +470,8 @@ class BleHeartRateService : Service() {
         const val ACTION_STOP = "com.example.a180d.action.STOP_SESSION"
 
         private const val AIR_DEVICE_NAME = "Google Fitbit Air"
-        private const val CHANNEL_ID = "heart_rate_session"
+        private const val LEGACY_LOW_IMPORTANCE_CHANNEL_ID = "heart_rate_session"
+        private const val CHANNEL_ID = "heart_rate_session_v2"
         private const val NOTIFICATION_ID = 1001
         private const val SCAN_TIMEOUT_MS = 8_000L
         private const val UNRECOVERABLE_AFTER_MS = 30_000L
@@ -428,6 +525,25 @@ class BleHeartRateService : Service() {
                 data[1].toInt() and 0xFF
             }
             return bpm.takeIf { it in 25..230 }
+        }
+
+        /**
+         * Formats session duration as mm:ss (or h:mm:ss past an hour). Computed
+         * by us rather than handed to the platform's native chronometer-style
+         * metric — that widget showed a transient "01:--" glitch around the
+         * minute-digit-width change on this device, so we drive the text
+         * ourselves at the same ~1 Hz the notification already updates at.
+         */
+        internal fun formatElapsed(nowMs: Long, startMs: Long): String {
+            val totalSeconds = ((nowMs - startMs) / 1000).coerceAtLeast(0)
+            val hours = totalSeconds / 3600
+            val minutes = (totalSeconds % 3600) / 60
+            val seconds = totalSeconds % 60
+            return if (hours > 0) {
+                "%d:%02d:%02d".format(hours, minutes, seconds)
+            } else {
+                "%02d:%02d".format(minutes, seconds)
+            }
         }
     }
 }
