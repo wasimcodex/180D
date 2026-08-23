@@ -85,13 +85,15 @@ class BleHeartRateService : Service() {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
+    private val _sessionStartMs = MutableStateFlow(0L)
+    val sessionStartMs: StateFlow<Long> = _sessionStartMs.asStateFlow()
+
     private var sessionActive = false
     private var targetDevice: BluetoothDevice? = null
     private var currentGatt: BluetoothGatt? = null
     private var reconnectJob: Job? = null
     private var firstDisconnectAtMs = 0L
     private var backoffIndex = 0
-    private var sessionStartMs = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -139,7 +141,7 @@ class BleHeartRateService : Service() {
             return
         }
         sessionActive = true
-        sessionStartMs = System.currentTimeMillis()
+        _sessionStartMs.value = System.currentTimeMillis()
         _lastError.value = null
         firstDisconnectAtMs = 0L
         backoffIndex = 0
@@ -160,7 +162,7 @@ class BleHeartRateService : Service() {
     @SuppressLint("MissingPermission")
     private fun stopSession() {
         sessionActive = false
-        sessionStartMs = 0L
+        _sessionStartMs.value = 0L
         reconnectJob?.cancel()
         reconnectJob = null
         currentGatt?.let { gatt ->
@@ -423,10 +425,11 @@ class BleHeartRateService : Service() {
             )
             metricCount++
         }
-        if (sessionStartMs > 0L) {
+        val sessionStart = sessionStartMs.value
+        if (sessionStart > 0L) {
             style.addMetric(
                 Notification.Metric(
-                    Notification.Metric.FixedText(formatElapsed(System.currentTimeMillis(), sessionStartMs)),
+                    Notification.Metric.FixedText(formatElapsed(System.currentTimeMillis(), sessionStart)),
                     "Elapsed",
                 ),
             )

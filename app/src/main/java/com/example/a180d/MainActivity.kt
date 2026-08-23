@@ -12,12 +12,25 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -33,6 +46,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -130,6 +148,7 @@ class MainActivity : ComponentActivity() {
 private val EMPTY_STATE_FLOW = MutableStateFlow(ConnectionState.DISCONNECTED)
 private val EMPTY_SAMPLE_FLOW = MutableStateFlow<HeartRateSample?>(null)
 private val EMPTY_ERROR_FLOW = MutableStateFlow<String?>(null)
+private val EMPTY_SESSION_START_FLOW = MutableStateFlow(0L)
 
 private const val STALE_AFTER_MS = 5_000L
 
@@ -189,6 +208,7 @@ private fun HeartRateScreen(
     val connectionState by (service?.connectionState ?: EMPTY_STATE_FLOW).collectAsStateWithLifecycle()
     val sample by (service?.latestSample ?: EMPTY_SAMPLE_FLOW).collectAsStateWithLifecycle()
     val error by (service?.lastError ?: EMPTY_ERROR_FLOW).collectAsStateWithLifecycle()
+    val sessionStartMs by (service?.sessionStartMs ?: EMPTY_SESSION_START_FLOW).collectAsStateWithLifecycle()
 
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
@@ -201,6 +221,7 @@ private fun HeartRateScreen(
     val ageMs = sample?.let { now - it.timestampMs }
     val isStale = ageMs != null && ageMs > STALE_AFTER_MS
     val sessionActive = connectionState != ConnectionState.DISCONNECTED
+    val elapsedText = if (sessionStartMs > 0L) BleHeartRateService.formatElapsed(now, sessionStartMs) else null
 
     Column(
         modifier = Modifier
@@ -234,6 +255,25 @@ private fun HeartRateScreen(
             },
         )
 
+        Spacer(Modifier.height(12.dp))
+
+        ZoneBar(
+            zone = zone,
+            isStale = isStale,
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .padding(horizontal = 8.dp),
+        )
+
+        elapsedText?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Elapsed $it",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+            )
+        }
+
         Spacer(Modifier.height(16.dp))
 
         if (isStale) {
@@ -246,7 +286,7 @@ private fun HeartRateScreen(
             }
         }
 
-        Text(text = connectionState.toDisplayLabel())
+        ConnectionStatusRow(connectionState)
 
         error?.let {
             Spacer(Modifier.height(8.dp))
@@ -275,4 +315,86 @@ private fun ConnectionState.toDisplayLabel(): String = when (this) {
     ConnectionState.CONNECTED -> "Connected"
     ConnectionState.RECONNECTING -> "Reconnecting…"
     ConnectionState.LINK_LOST_UNRECOVERABLE -> "Connection lost"
+}
+
+private fun ConnectionState.indicatorColor(): Color = when (this) {
+    ConnectionState.DISCONNECTED -> Color(0xFF9E9E9E)
+    ConnectionState.SCANNING,
+    ConnectionState.CONNECTING,
+    ConnectionState.DISCOVERING,
+    ConnectionState.RECONNECTING,
+    -> Color(0xFFFFA726)
+    ConnectionState.CONNECTED -> Color(0xFF66BB6A)
+    ConnectionState.LINK_LOST_UNRECOVERABLE -> Color(0xFFEF5350)
+}
+
+private fun ConnectionState.isInProgress(): Boolean = this == ConnectionState.SCANNING ||
+    this == ConnectionState.CONNECTING ||
+    this == ConnectionState.DISCOVERING ||
+    this == ConnectionState.RECONNECTING
+
+@Composable
+private fun ConnectionStatusRow(connectionState: ConnectionState) {
+    val pulse by rememberInfiniteTransition(label = "statusPulse").animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(animation = tween(700), repeatMode = RepeatMode.Reverse),
+        label = "statusPulseAlpha",
+    )
+    val dotAlpha = if (connectionState.isInProgress()) pulse else 1f
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(connectionState.indicatorColor().copy(alpha = dotAlpha)),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(text = connectionState.toDisplayLabel())
+    }
+}
+
+private val ZONE_BAR_COLORS = listOf(
+    Color(0xFF4FC3F7), // Zone 1
+    Color(0xFF66BB6A), // Zone 2
+    Color(0xFFFFEE58), // Zone 3
+    Color(0xFFFFA726), // Zone 4
+    Color(0xFFEF5350), // Zone 5
+)
+
+/**
+ * Horizontal 5-segment zone bar (Z1..Z5) with a marker at the current
+ * fractional position. computeZone() returns zoneIndex+fraction where
+ * zoneIndex 1..5 map to Z1..Z5, so shifting by -1 and dividing by 5 spans
+ * the whole bar across the five zones; below the Z1 floor (zone < 1.0) the
+ * marker just pins to the left edge rather than getting its own segment.
+ */
+@Composable
+private fun ZoneBar(zone: Double?, isStale: Boolean, modifier: Modifier = Modifier) {
+    val alpha = if (isStale || zone == null) 0.35f else 1f
+    val fraction = zone?.let { ((it - 1.0) / 5.0).coerceIn(0.0, 1.0).toFloat() }
+
+    Canvas(
+        modifier = modifier.height(14.dp),
+    ) {
+        val segmentGap = 3.dp.toPx()
+        val segmentWidth = (size.width - segmentGap * (ZONE_BAR_COLORS.size - 1)) / ZONE_BAR_COLORS.size
+        val corner = CornerRadius(4.dp.toPx(), 4.dp.toPx())
+        ZONE_BAR_COLORS.forEachIndexed { index, color ->
+            drawRoundRect(
+                color = color.copy(alpha = alpha),
+                topLeft = Offset(index * (segmentWidth + segmentGap), 0f),
+                size = Size(segmentWidth, size.height),
+                cornerRadius = corner,
+            )
+        }
+        if (fraction != null) {
+            val markerRadius = size.height * 0.75f
+            val markerX = (fraction * size.width).coerceIn(markerRadius, size.width - markerRadius)
+            val markerY = size.height / 2
+            drawCircle(color = Color.Black.copy(alpha = 0.55f), radius = markerRadius, center = Offset(markerX, markerY))
+            drawCircle(color = Color.White, radius = markerRadius * 0.6f, center = Offset(markerX, markerY))
+        }
+    }
 }
