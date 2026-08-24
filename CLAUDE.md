@@ -89,7 +89,7 @@ been verified against real hardware (2026-08-24, Pixel 6a, nRF Connect).
    `api.fitbit.com/1/user/...` is dead. Do not import a Fitbit SDK.
 2. **Do NOT use Health Connect for the live number.** Health Connect is a valid
    path for *historical* data, but the Air only syncs to the Google Health app
-   roughly every 15 minutes. It cannot produce a live reading. This app does not
+   roughly every 5 minutes. It cannot produce a live reading. This app does not
    touch Health Connect at all.
 3. **Do NOT use the Fitbit device SDK / Fitbit Studio.** Discontinued, and the
    Air is screenless — there is no on-device app surface.
