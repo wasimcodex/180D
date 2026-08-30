@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -47,10 +48,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -61,6 +63,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.a180d.ui.theme.AppTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.math.cos
+import kotlin.math.sin
 
 private val REQUIRED_PERMISSIONS: Array<String> = buildList {
     add(Manifest.permission.BLUETOOTH_CONNECT)
@@ -230,39 +234,15 @@ private fun HeartRateScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Text(
-            text = sample?.bpm?.toString() ?: "--",
-            fontSize = 96.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (isStale || sample == null) {
-                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
-            } else {
-                MaterialTheme.colorScheme.primary
-            },
-        )
-        Text(text = "bpm", style = MaterialTheme.typography.titleMedium)
-
-        Spacer(Modifier.height(8.dp))
-
         val zone = sample?.let { HeartRateZones.computeZone(it.bpm, zoneSettings.age, zoneSettings.restingHr) }
-        Text(
-            text = zone?.let { "Zone ${"%.1f".format(it)}" } ?: "Zone --",
-            style = MaterialTheme.typography.titleMedium,
-            color = if (isStale || zone == null) {
-                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
-            } else {
-                MaterialTheme.colorScheme.secondary
-            },
-        )
 
-        Spacer(Modifier.height(12.dp))
-
-        ZoneBar(
+        ZoneDial(
+            bpm = sample?.bpm,
             zone = zone,
             isStale = isStale,
             modifier = Modifier
-                .fillMaxWidth(0.85f)
-                .padding(horizontal = 8.dp),
+                .fillMaxWidth(0.68f)
+                .aspectRatio(1f),
         )
 
         elapsedText?.let {
@@ -355,7 +335,7 @@ private fun ConnectionStatusRow(connectionState: ConnectionState) {
     }
 }
 
-private val ZONE_BAR_COLORS = listOf(
+private val ZONE_COLORS = listOf(
     Color(0xFF4FC3F7), // Zone 1
     Color(0xFF66BB6A), // Zone 2
     Color(0xFFFFEE58), // Zone 3
@@ -363,38 +343,90 @@ private val ZONE_BAR_COLORS = listOf(
     Color(0xFFEF5350), // Zone 5
 )
 
+private const val DIAL_START_ANGLE = 135f
+private const val DIAL_SWEEP_ANGLE = 270f
+private const val DIAL_SEGMENT_GAP_DEGREES = 3f
+
 /**
- * Horizontal 5-segment zone bar (Z1..Z5) with a marker at the current
- * fractional position. computeZone() returns zoneIndex+fraction where
- * zoneIndex 1..5 map to Z1..Z5, so shifting by -1 and dividing by 5 spans
- * the whole bar across the five zones; below the Z1 floor (zone < 1.0) the
- * marker just pins to the left edge rather than getting its own segment.
+ * Circular zone gauge (270° sweep, gap at the bottom) with BPM/zone readout
+ * in the center. Same fraction mapping as the old bar version
+ * ((zone-1.0)/5.0 across zoneIndex 1..5 = Z1..Z5) just bent from a straight
+ * line into an arc; below the Z1 floor (zone < 1.0) the marker pins to the
+ * start of the arc rather than getting its own segment.
  */
 @Composable
-private fun ZoneBar(zone: Double?, isStale: Boolean, modifier: Modifier = Modifier) {
+private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modifier = Modifier) {
     val alpha = if (isStale || zone == null) 0.35f else 1f
     val fraction = zone?.let { ((it - 1.0) / 5.0).coerceIn(0.0, 1.0).toFloat() }
 
-    Canvas(
-        modifier = modifier.height(14.dp),
-    ) {
-        val segmentGap = 3.dp.toPx()
-        val segmentWidth = (size.width - segmentGap * (ZONE_BAR_COLORS.size - 1)) / ZONE_BAR_COLORS.size
-        val corner = CornerRadius(4.dp.toPx(), 4.dp.toPx())
-        ZONE_BAR_COLORS.forEachIndexed { index, color ->
-            drawRoundRect(
-                color = color.copy(alpha = alpha),
-                topLeft = Offset(index * (segmentWidth + segmentGap), 0f),
-                size = Size(segmentWidth, size.height),
-                cornerRadius = corner,
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokeWidth = size.minDimension * 0.07f
+            val arcDiameter = size.minDimension - strokeWidth
+            val arcSize = Size(arcDiameter, arcDiameter)
+            val topLeft = Offset((size.width - arcDiameter) / 2f, (size.height - arcDiameter) / 2f)
+            val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+
+            drawArc(
+                color = Color.White.copy(alpha = 0.08f),
+                startAngle = DIAL_START_ANGLE,
+                sweepAngle = DIAL_SWEEP_ANGLE,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = stroke,
             )
+
+            val segmentSweep = (DIAL_SWEEP_ANGLE - DIAL_SEGMENT_GAP_DEGREES * (ZONE_COLORS.size - 1)) / ZONE_COLORS.size
+            ZONE_COLORS.forEachIndexed { index, color ->
+                val segmentStart = DIAL_START_ANGLE + index * (segmentSweep + DIAL_SEGMENT_GAP_DEGREES)
+                drawArc(
+                    color = color.copy(alpha = alpha),
+                    startAngle = segmentStart,
+                    sweepAngle = segmentSweep,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = stroke,
+                )
+            }
+
+            if (fraction != null) {
+                val angleRad = Math.toRadians((DIAL_START_ANGLE + fraction * DIAL_SWEEP_ANGLE).toDouble())
+                val radius = arcDiameter / 2f
+                val center = Offset(topLeft.x + radius, topLeft.y + radius)
+                val markerCenter = Offset(
+                    center.x + radius * cos(angleRad).toFloat(),
+                    center.y + radius * sin(angleRad).toFloat(),
+                )
+                val markerRadius = strokeWidth * 0.65f
+                drawCircle(color = Color.Black.copy(alpha = 0.55f), radius = markerRadius, center = markerCenter)
+                drawCircle(color = Color.White, radius = markerRadius * 0.6f, center = markerCenter)
+            }
         }
-        if (fraction != null) {
-            val markerRadius = size.height * 0.75f
-            val markerX = (fraction * size.width).coerceIn(markerRadius, size.width - markerRadius)
-            val markerY = size.height / 2
-            drawCircle(color = Color.Black.copy(alpha = 0.55f), radius = markerRadius, center = Offset(markerX, markerY))
-            drawCircle(color = Color.White, radius = markerRadius * 0.6f, center = Offset(markerX, markerY))
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = bpm?.toString() ?: "--",
+                fontSize = 76.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (isStale || bpm == null) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+            )
+            Text(text = "bpm", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = zone?.let { "Zone ${"%.1f".format(it)}" } ?: "Zone --",
+                style = MaterialTheme.typography.titleMedium,
+                color = if (isStale || zone == null) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                } else {
+                    MaterialTheme.colorScheme.secondary
+                },
+            )
         }
     }
 }
