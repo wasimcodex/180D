@@ -75,6 +75,7 @@ class BleHeartRateService : Service() {
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private lateinit var notificationManager: NotificationManager
     private val userSettings by lazy { UserSettings(this) }
+    val sessionRepository by lazy { SessionRepository(this) }
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -141,10 +142,12 @@ class BleHeartRateService : Service() {
             return
         }
         sessionActive = true
-        _sessionStartMs.value = System.currentTimeMillis()
+        val startMs = System.currentTimeMillis()
+        _sessionStartMs.value = startMs
         _lastError.value = null
         firstDisconnectAtMs = 0L
         backoffIndex = 0
+        serviceScope.launch { sessionRepository.startSession(startMs) }
         serviceScope.launch {
             _connectionState.value = ConnectionState.SCANNING
             val device = findAirDevice()
@@ -173,6 +176,7 @@ class BleHeartRateService : Service() {
         targetDevice = null
         _connectionState.value = ConnectionState.DISCONNECTED
         _latestSample.value = null
+        serviceScope.launch { sessionRepository.endSession() }
     }
 
     // ---- Device discovery ---------------------------------------------------
@@ -317,7 +321,9 @@ class BleHeartRateService : Service() {
         when (uuid) {
             HR_MEASUREMENT_UUID -> {
                 val bpm = value?.let { parseHeartRateBpm(it) } ?: return
-                _latestSample.value = HeartRateSample(bpm, System.currentTimeMillis())
+                val sample = HeartRateSample(bpm, System.currentTimeMillis())
+                _latestSample.value = sample
+                serviceScope.launch { sessionRepository.recordSample(sample) }
             }
             SERVICE_CHANGED_UUID -> gatt.discoverServices()
         }

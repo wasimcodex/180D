@@ -41,22 +41,40 @@ is needed for Compose. Implemented so far:
   On `CINNAMON_BUN` (API 37 / Android 17) with
   `NotificationManager.canPostPromotedNotifications() == true`, a native
   `android.app.Notification.Builder` + `Notification.MetricStyle` renders
-  BPM (critical metric), zone, and elapsed (`Metric.TimeDifference`
-  chronometer, ticks natively without our involvement) directly on the lock
-  screen and AOD — confirmed by the OS itself, not just requested:
-  `flags` includes `PROMOTED_ONGOING` and `template` reads
-  `android.app.Notification$MetricStyle` in `dumpsys notification`. Below
-  that tier it falls back to a promoted `NotificationCompat` builder, and
-  below that (promotion declined) a plain public/default-importance ongoing
-  notification — all three are exercised by the same code path, gated on
-  `Build.VERSION.SDK_INT` and the live capability check, not a device
-  allowlist.
+  BPM (critical metric), zone, and elapsed directly on the lock screen and
+  AOD — confirmed by the OS itself, not just requested: `flags` includes
+  `PROMOTED_ONGOING` and `template` reads `android.app.Notification$MetricStyle`
+  in `dumpsys notification`. Below that tier it falls back to a promoted
+  `NotificationCompat` builder, and below that (promotion declined) a plain
+  public/default-importance ongoing notification — all three are exercised
+  by the same code path, gated on `Build.VERSION.SDK_INT` and the live
+  capability check, not a device allowlist.
   `Notification.MetricStyle` throws if it has zero metrics — guard any
   future edit to the metric-adding logic (e.g. don't call
   `buildNotification()` before `sessionStartMs` is set, and keep the
-  zero-metric fallback that adds a `FixedText` status metric).
+  zero-metric fallback that adds a `FixedText` status metric). The elapsed
+  metric is a self-formatted `mm:ss` `FixedText` (`BleHeartRateService.formatElapsed`),
+  not the platform's native `Metric.TimeDifference` chronometer — that
+  widget showed a transient "01:--" glitch around the minute-digit-width
+  change on this device, so we compute the string ourselves at the same
+  ~1 Hz the notification already updates at rather than trust the native
+  ticking.
+- Session logging: Room (`SessionStorage.kt` — `SessionEntity`/`SampleEntity`
+  tables, `SessionRepository`). A provisional session row is created when a
+  BLE session starts; samples batch-insert every 10 (`SessionRepository.SAMPLE_BATCH_SIZE`).
+  On "End session", if any samples were recorded the row is exposed via
+  `pendingSession` and `MainActivity` shows a blocking (no dismiss-by-outside-tap)
+  save-or-discard dialog with an optional title field; discard deletes the
+  row (cascade-deletes its samples via the FK), save just sets the title.
+  A zero-sample session (tapped Start then End before any data arrived) is
+  deleted automatically with no prompt. A "Session history" screen lists
+  saved sessions with per-session CSV export (`FileProvider`, `Intent.ACTION_SEND`)
+  and delete. Uses KSP for Room's annotation processing — see "Room + KSP"
+  under Build & tooling for a real gotcha this hit.
 
-Not yet implemented: session logging (Room/CSV).
+Not yet implemented: nothing from the original v1 feature list — remaining
+work is the local-network web server (not yet designed) and the unverified
+reconnect/endurance items below.
 
 **Verified on the Pixel 6a (2026-08-24):** connect, GATT `refresh()` cache
 workaround, service discovery, HR notification subscription, live BPM in the
@@ -399,14 +417,26 @@ Update in place with the same notification ID at ~1 Hz. Do not re-post.
 
 ## Session logging
 
-Room database, one row per sample: `timestampMs`, `bpm`, `sessionId`.
+**Implemented** — see "Current implementation state" above for the
+mechanics. Room database, one row per sample: `timestampMs`, `bpm`,
+`sessionId`.
 
 At 1 Hz a 60-minute session is ~3,600 rows. Trivial. This is data the cloud API
 will never provide at this resolution, so keep all of it. Batch inserts every
 ~10 samples rather than writing per-notification.
 
-Include a CSV export. Do not add cloud sync, accounts, or analytics — this app
-is local-only by design and handles health data.
+CSV export via `FileProvider` + `Intent.ACTION_SEND` (chooser), not a direct
+file write to shared storage — avoids needing any storage permission.
+
+The save/discard decision happens *after* the session ends, not before
+logging starts: samples are batch-written throughout the live session
+(matching the "keep all of it" goal above and avoiding data loss if the app
+dies mid-session), and the row + its samples are simply deleted if the user
+discards. Don't restructure this to buffer everything in memory until a
+save decision — that reintroduces the data-loss risk this design avoids.
+
+Do not add cloud sync, accounts, or analytics — this app is local-only by
+design and handles health data.
 
 ---
 
@@ -471,12 +501,33 @@ BLE failures are asynchronous and easy to miss in the full stream.
 Gradle's daemon toolchain is pinned to JDK 25 (`gradle/gradle-daemon-jvm.properties`);
 app source/target compatibility is Java 11 (`app/build.gradle.kts`).
 
+### Room + KSP under AGP's built-in Kotlin
+
+Room needs an annotation processor (KSP) to generate DAO implementations —
+there's no processor-free option. KSP's Gradle plugin registers its
+generated source directory via the classic `kotlin.sourceSets` DSL, which
+AGP's built-in Kotlin support (see top of file) rejects by default:
+
+```
+Using kotlin.sourceSets DSL to add Kotlin sources is not allowed with built-in Kotlin.
+Solution: Use android.sourceSets DSL instead.
+```
+
+KSP doesn't know about built-in Kotlin yet, so there's no real fix on our
+side — the escape hatch is `android.disallowKotlinSourceSets=false` in
+`gradle.properties` (already set, with a comment explaining why). Without
+it, `kspDebugKotlin` fails at configuration time before any Room code even
+runs. Pin the KSP version to match the Kotlin version exactly
+(`2.2.10-2.0.2` for Kotlin `2.2.10`) — check
+`https://plugins.gradle.org/m2/com/google/devtools/ksp/com.google.devtools.ksp.gradle.plugin/maven-metadata.xml`
+for what's available if the Kotlin version ever changes.
+
 ### Dependencies
 
 ```
 androidx.core:core-ktx            >= 1.17.0   // setRequestPromotedOngoing
 androidx.compose (BOM)                        // in-app UI
-androidx.room:room-runtime + room-ktx         // session storage
+androidx.room:room-runtime + room-ktx + room-compiler (via KSP)  // session storage
 kotlinx-coroutines-android
 ```
 

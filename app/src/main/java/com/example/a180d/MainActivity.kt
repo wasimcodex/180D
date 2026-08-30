@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -30,9 +31,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -44,6 +50,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +60,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -63,6 +71,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.a180d.ui.theme.AppTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -109,13 +121,33 @@ class MainActivity : ComponentActivity() {
                             },
                         )
                     } else {
-                        HeartRateScreen(
-                            service = boundService,
-                            zoneSettings = settings,
-                            onStartSession = { if (hasRequiredPermissions()) startSession() else permissionLauncher.launch(REQUIRED_PERMISSIONS) },
-                            onEndSession = ::endSession,
-                            onEditZoneSettings = { zoneSettings = null },
-                        )
+                        var showHistory by remember { mutableStateOf(false) }
+                        if (showHistory) {
+                            SessionHistoryScreen(
+                                service = boundService,
+                                onBack = { showHistory = false },
+                            )
+                        } else {
+                            HeartRateScreen(
+                                service = boundService,
+                                zoneSettings = settings,
+                                onStartSession = { if (hasRequiredPermissions()) startSession() else permissionLauncher.launch(REQUIRED_PERMISSIONS) },
+                                onEndSession = ::endSession,
+                                onEditZoneSettings = { zoneSettings = null },
+                                onShowHistory = { showHistory = true },
+                            )
+                        }
+
+                        val pendingSession by (boundService?.sessionRepository?.pendingSession ?: EMPTY_PENDING_SESSION_FLOW)
+                            .collectAsStateWithLifecycle()
+                        val scope = rememberCoroutineScope()
+                        pendingSession?.let { session ->
+                            SaveSessionDialog(
+                                session = session,
+                                onDiscard = { scope.launch { boundService?.sessionRepository?.discardPendingSession() } },
+                                onSave = { title -> scope.launch { boundService?.sessionRepository?.savePendingSession(title) } },
+                            )
+                        }
                     }
                 }
             }
@@ -153,6 +185,8 @@ private val EMPTY_STATE_FLOW = MutableStateFlow(ConnectionState.DISCONNECTED)
 private val EMPTY_SAMPLE_FLOW = MutableStateFlow<HeartRateSample?>(null)
 private val EMPTY_ERROR_FLOW = MutableStateFlow<String?>(null)
 private val EMPTY_SESSION_START_FLOW = MutableStateFlow(0L)
+private val EMPTY_PENDING_SESSION_FLOW = MutableStateFlow<SessionEntity?>(null)
+private val EMPTY_SESSIONS_FLOW = MutableStateFlow<List<SessionEntity>>(emptyList())
 
 private const val STALE_AFTER_MS = 5_000L
 
@@ -208,6 +242,7 @@ private fun HeartRateScreen(
     onStartSession: () -> Unit,
     onEndSession: () -> Unit,
     onEditZoneSettings: () -> Unit,
+    onShowHistory: () -> Unit,
 ) {
     val connectionState by (service?.connectionState ?: EMPTY_STATE_FLOW).collectAsStateWithLifecycle()
     val sample by (service?.latestSample ?: EMPTY_SAMPLE_FLOW).collectAsStateWithLifecycle()
@@ -283,6 +318,9 @@ private fun HeartRateScreen(
             Spacer(Modifier.height(8.dp))
             TextButton(onClick = onEditZoneSettings) {
                 Text("Edit age / resting HR")
+            }
+            TextButton(onClick = onShowHistory) {
+                Text("Session history")
             }
         }
     }
@@ -427,6 +465,110 @@ private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modif
                     MaterialTheme.colorScheme.secondary
                 },
             )
+        }
+    }
+}
+
+private fun formatSessionSubtitle(session: SessionEntity): String {
+    val dateFormat = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
+    val durationSec = ((session.endedAtMs - session.startedAtMs) / 1000).coerceAtLeast(0)
+    return "${dateFormat.format(Date(session.startedAtMs))} • ${durationSec / 60}m ${durationSec % 60}s"
+}
+
+private fun shareCsv(context: Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/csv"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Export session"))
+}
+
+/** Blocks dismissal via back/outside-tap so the user makes an explicit save-or-discard choice. */
+@Composable
+private fun SaveSessionDialog(session: SessionEntity, onDiscard: () -> Unit, onSave: (String) -> Unit) {
+    var titleText by remember(session.id) { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Save this session?") },
+        text = {
+            Column {
+                Text("Recorded ${formatSessionSubtitle(session)}.")
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = titleText,
+                    onValueChange = { titleText = it },
+                    label = { Text("Title (optional)") },
+                    singleLine = true,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(titleText) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDiscard) { Text("Discard") } },
+    )
+}
+
+@Composable
+private fun SessionHistoryScreen(service: BleHeartRateService?, onBack: () -> Unit) {
+    val sessions by (service?.sessionRepository?.sessions ?: EMPTY_SESSIONS_FLOW)
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .padding(24.dp),
+    ) {
+        TextButton(onClick = onBack) { Text("← Back") }
+        Spacer(Modifier.height(8.dp))
+        Text(text = "Session history", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(16.dp))
+
+        if (sessions.isEmpty()) {
+            Text(
+                text = "No saved sessions yet.",
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+            )
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(sessions, key = { it.id }) { session ->
+                    SessionRow(
+                        session = session,
+                        onExport = {
+                            scope.launch {
+                                val uri = service?.sessionRepository?.exportCsv(session) ?: return@launch
+                                shareCsv(context, uri)
+                            }
+                        },
+                        onDelete = { scope.launch { service?.sessionRepository?.deleteSession(session) } },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionRow(session: SessionEntity, onExport: () -> Unit, onDelete: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+            .padding(16.dp),
+    ) {
+        Text(text = session.title, style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = formatSessionSubtitle(session),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+        )
+        Spacer(Modifier.height(8.dp))
+        Row {
+            TextButton(onClick = onExport) { Text("Export CSV") }
+            TextButton(onClick = onDelete) { Text("Delete") }
         }
     }
 }
