@@ -22,6 +22,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,6 +35,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -62,6 +65,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -80,10 +84,14 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -409,7 +417,7 @@ private fun HeartRateScreen(
             }
         }
 
-        TrendGraphCard(samples = recentSamples, currentZone = zone, modifier = Modifier.padding(horizontal = 20.dp))
+        TrendGraphCard(samples = recentSamples, currentZone = zone, zoneSettings = zoneSettings, modifier = Modifier.padding(horizontal = 20.dp))
 
         Spacer(Modifier.height(18.dp))
 
@@ -625,7 +633,7 @@ private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modif
 }
 
 @Composable
-private fun TrendGraphCard(samples: List<HeartRateSample>, currentZone: Double?, modifier: Modifier = Modifier) {
+private fun TrendGraphCard(samples: List<HeartRateSample>, currentZone: Double?, zoneSettings: ZoneSettings, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -649,18 +657,173 @@ private fun TrendGraphCard(samples: List<HeartRateSample>, currentZone: Double?,
                 )
             }
         } else {
-            val lineColor = zoneSegmentColor(currentZone)
-            val onSurfaceColor = MaterialTheme.colorScheme.onSurface
-            val surfaceColor = MaterialTheme.colorScheme.surface
-            Canvas(modifier = Modifier.fillMaxWidth().height(110.dp)) {
-                drawBpmChart(
-                    samples = samples,
-                    lineColor = lineColor,
-                    textColor = onSurfaceColor,
-                    surfaceColor = surfaceColor,
-                    highlightLatest = true,
-                )
+            InteractiveBpmChart(
+                samples = samples,
+                lineColor = zoneSegmentColor(currentZone),
+                zoneSettings = zoneSettings,
+                highlightLatest = true,
+                modifier = Modifier.fillMaxWidth().height(110.dp),
+            )
+        }
+    }
+}
+
+private data class ChartBounds(val minTs: Long, val maxTs: Long, val bpmMin: Double, val bpmMax: Double)
+
+/** Same axis padding/scaling both [drawBpmChart] and its interactive overlay need to agree on. */
+private fun computeChartBounds(samples: List<HeartRateSample>, zoneBoundariesBpm: List<Double>?): ChartBounds {
+    val dataMin = samples.minOf { it.bpm }
+    val dataMax = samples.maxOf { it.bpm }
+    return ChartBounds(
+        minTs = samples.first().timestampMs,
+        maxTs = samples.last().timestampMs,
+        bpmMin = zoneBoundariesBpm?.first()?.coerceAtMost(dataMin - 4.0) ?: (dataMin - 4).toDouble(),
+        bpmMax = zoneBoundariesBpm?.last()?.coerceAtLeast(dataMax + 4.0) ?: (dataMax + 4).toDouble(),
+    )
+}
+
+/** Maps a touch x-position (0..widthPx) back to a timestamp, using the same bounds as [computeChartBounds]. */
+private fun timestampForX(xPx: Float, samples: List<HeartRateSample>, widthPx: Int): Long {
+    val minTs = samples.first().timestampMs
+    val maxTs = samples.last().timestampMs
+    val fraction = if (widthPx > 0) (xPx / widthPx).coerceIn(0f, 1f) else 0f
+    return minTs + (fraction * (maxTs - minTs)).toLong()
+}
+
+/** Nearest sample to [targetTs] by binary search; samples must be timestamp-ascending. */
+private fun nearestSampleIndex(samples: List<HeartRateSample>, targetTs: Long): Int {
+    var lo = 0
+    var hi = samples.lastIndex
+    while (lo < hi) {
+        val mid = (lo + hi) / 2
+        if (samples[mid].timestampMs < targetTs) lo = mid + 1 else hi = mid
+    }
+    if (lo > 0 && kotlin.math.abs(samples[lo - 1].timestampMs - targetTs) <= kotlin.math.abs(samples[lo].timestampMs - targetTs)) {
+        return lo - 1
+    }
+    return lo
+}
+
+/**
+ * A [drawBpmChart] wrapped with press/drag-to-scrub: touching the chart shows
+ * a crosshair and a floating tooltip with the BPM/time/zone at that point,
+ * following the finger; lifting clears it. The gesture responds from the
+ * initial touch-down rather than waiting for a drag threshold.
+ */
+@Composable
+private fun InteractiveBpmChart(
+    samples: List<HeartRateSample>,
+    lineColor: Color,
+    zoneSettings: ZoneSettings,
+    highlightLatest: Boolean,
+    zoneBoundariesBpm: List<Double>? = null,
+    modifier: Modifier = Modifier,
+) {
+    val onSurfaceColor = MaterialTheme.colorScheme.onSurface
+    val surfaceColor = MaterialTheme.colorScheme.surface
+    var selectedIndex by remember { mutableStateOf<Int?>(null) }
+    var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    val latestSamples = rememberUpdatedState(samples)
+
+    Box(modifier = modifier) {
+        Canvas(
+            modifier = Modifier
+                .matchParentSize()
+                .onSizeChanged { canvasSize = it }
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        fun select(x: Float) {
+                            val current = latestSamples.value
+                            selectedIndex = if (current.size < 2 || size.width == 0) {
+                                null
+                            } else {
+                                nearestSampleIndex(current, timestampForX(x, current, size.width))
+                            }
+                        }
+
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        select(down.position.x)
+                        val pointerId = down.id
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                            if (!change.pressed) break
+                            change.consume()
+                            select(change.position.x)
+                        }
+                        selectedIndex = null
+                    }
+                },
+        ) {
+            drawBpmChart(
+                samples = samples,
+                lineColor = lineColor,
+                textColor = onSurfaceColor,
+                surfaceColor = surfaceColor,
+                zoneBoundariesBpm = zoneBoundariesBpm,
+                highlightLatest = highlightLatest,
+                selectedIndex = selectedIndex,
+            )
+        }
+
+        val index = selectedIndex
+        if (index != null && index in samples.indices && canvasSize.width > 0) {
+            val bounds = computeChartBounds(samples, zoneBoundariesBpm)
+            val tsRange = (bounds.maxTs - bounds.minTs).coerceAtLeast(1L)
+            val bpmRange = (bounds.bpmMax - bounds.bpmMin).coerceAtLeast(1.0)
+            val sample = samples[index]
+            val pointPx = Offset(
+                x = canvasSize.width * (sample.timestampMs - bounds.minTs).toFloat() / tsRange,
+                y = canvasSize.height - (canvasSize.height * ((sample.bpm - bounds.bpmMin) / bpmRange)).toFloat(),
+            )
+            ScrubTooltip(sample = sample, zoneSettings = zoneSettings, pointPx = pointPx, canvasSize = canvasSize)
+        }
+    }
+}
+
+@Composable
+private fun ScrubTooltip(sample: HeartRateSample, zoneSettings: ZoneSettings, pointPx: Offset, canvasSize: IntSize) {
+    val density = LocalDensity.current
+    val zoneIndex = zoneSegmentIndex(HeartRateZones.computeZone(sample.bpm, zoneSettings.age, zoneSettings.restingHr)).coerceAtLeast(0)
+    val widthDp = 122.dp
+    val heightDp = 54.dp
+
+    val offsetX: androidx.compose.ui.unit.Dp
+    val offsetY: androidx.compose.ui.unit.Dp
+    with(density) {
+        val widthPx = widthDp.toPx()
+        val heightPx = heightDp.toPx()
+        val gapPx = 10.dp.toPx()
+        val x = (pointPx.x - widthPx / 2f).coerceIn(0f, (canvasSize.width - widthPx).coerceAtLeast(0f))
+        val yAbove = pointPx.y - heightPx - gapPx
+        val y = if (yAbove >= 0f) yAbove else (pointPx.y + gapPx).coerceAtMost((canvasSize.height - heightPx).coerceAtLeast(0f))
+        offsetX = x.toDp()
+        offsetY = y.toDp()
+    }
+
+    Box(
+        modifier = Modifier
+            .offset(x = offsetX, y = offsetY)
+            .width(widthDp)
+            .height(heightDp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(sample.bpm.toString(), fontFamily = SpaceGroteskFamily, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface)
+                Spacer(Modifier.width(3.dp))
+                Text("bpm", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
             }
+            Text(
+                text = "${timeLabelWithSeconds(sample.timestampMs)} · Z${zoneIndex + 1}",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = zoneChipTextColor(zoneIndex),
+            )
         }
     }
 }
@@ -670,7 +833,9 @@ private fun TrendGraphCard(samples: List<HeartRateSample>, currentZone: Double?,
  * behind the line (session-detail's full view); without it, draws two plain
  * gridlines (the live trend card, where zone-accurate bands aren't worth the
  * clutter at that size). [highlightLatest] marks the most recent point
- * (live trend); otherwise the peak is marked (session detail).
+ * (live trend); otherwise the peak is marked (session detail) — both only
+ * when [selectedIndex] is null, since a scrub in progress replaces the
+ * highlight with a crosshair at the touched sample instead.
  */
 private fun DrawScope.drawBpmChart(
     samples: List<HeartRateSample>,
@@ -679,17 +844,15 @@ private fun DrawScope.drawBpmChart(
     surfaceColor: Color,
     zoneBoundariesBpm: List<Double>? = null,
     highlightLatest: Boolean,
+    selectedIndex: Int? = null,
 ) {
-    val minTs = samples.first().timestampMs
-    val maxTs = samples.last().timestampMs
-    val tsRange = (maxTs - minTs).coerceAtLeast(1L)
-    val dataMin = samples.minOf { it.bpm }
-    val dataMax = samples.maxOf { it.bpm }
-    val bpmMin = zoneBoundariesBpm?.first()?.coerceAtMost(dataMin - 4.0) ?: (dataMin - 4).toDouble()
-    val bpmMax = zoneBoundariesBpm?.last()?.coerceAtLeast(dataMax + 4.0) ?: (dataMax + 4).toDouble()
+    val bounds = computeChartBounds(samples, zoneBoundariesBpm)
+    val tsRange = (bounds.maxTs - bounds.minTs).coerceAtLeast(1L)
+    val bpmMin = bounds.bpmMin
+    val bpmMax = bounds.bpmMax
     val bpmRange = (bpmMax - bpmMin).coerceAtLeast(1.0)
 
-    fun xFor(ts: Long) = size.width * (ts - minTs).toFloat() / tsRange
+    fun xFor(ts: Long) = size.width * (ts - bounds.minTs).toFloat() / tsRange
     fun yFor(bpm: Double) = size.height - (size.height * ((bpm - bpmMin) / bpmRange)).toFloat()
 
     if (zoneBoundariesBpm != null && zoneBoundariesBpm.size >= 6) {
@@ -744,17 +907,32 @@ private fun DrawScope.drawBpmChart(
     drawPath(fillPath, brush = Brush.verticalGradient(listOf(lineColor.copy(alpha = 0.3f), lineColor.copy(alpha = 0f))))
     drawPath(linePath, color = lineColor, style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
 
-    val highlight = if (highlightLatest) samples.last() else samples.maxByOrNull { it.bpm }!!
-    val hx = xFor(highlight.timestampMs)
-    val hy = yFor(highlight.bpm.toDouble())
-    drawCircle(surfaceColor, radius = 7.dp.toPx(), center = Offset(hx, hy))
-    drawCircle(lineColor, radius = 4.dp.toPx(), center = Offset(hx, hy))
-    drawContext.canvas.nativeCanvas.drawText(
-        highlight.bpm.toString(),
-        hx.coerceIn(16.dp.toPx(), size.width - 16.dp.toPx()),
-        (hy - 10.dp.toPx()).coerceAtLeast(12.dp.toPx()),
-        textPaint(textColor, 12.sp.toPx(), android.graphics.Paint.Align.CENTER, bold = true),
-    )
+    if (selectedIndex != null && selectedIndex in samples.indices) {
+        val selected = samples[selectedIndex]
+        val sx = xFor(selected.timestampMs)
+        val sy = yFor(selected.bpm.toDouble())
+        drawLine(
+            color = textColor.copy(alpha = 0.25f),
+            start = Offset(sx, 0f),
+            end = Offset(sx, size.height),
+            strokeWidth = 1.dp.toPx(),
+            pathEffect = PathEffect.dashPathEffect(floatArrayOf(2.dp.toPx(), 3.dp.toPx())),
+        )
+        drawCircle(surfaceColor, radius = 7.dp.toPx(), center = Offset(sx, sy))
+        drawCircle(lineColor, radius = 4.dp.toPx(), center = Offset(sx, sy))
+    } else {
+        val highlight = if (highlightLatest) samples.last() else samples.maxByOrNull { it.bpm }!!
+        val hx = xFor(highlight.timestampMs)
+        val hy = yFor(highlight.bpm.toDouble())
+        drawCircle(surfaceColor, radius = 7.dp.toPx(), center = Offset(hx, hy))
+        drawCircle(lineColor, radius = 4.dp.toPx(), center = Offset(hx, hy))
+        drawContext.canvas.nativeCanvas.drawText(
+            highlight.bpm.toString(),
+            hx.coerceIn(16.dp.toPx(), size.width - 16.dp.toPx()),
+            (hy - 10.dp.toPx()).coerceAtLeast(12.dp.toPx()),
+            textPaint(textColor, 12.sp.toPx(), android.graphics.Paint.Align.CENTER, bold = true),
+        )
+    }
 }
 
 private fun textPaint(color: Color, textSizePx: Float, align: android.graphics.Paint.Align, bold: Boolean = false) =
@@ -1326,19 +1504,14 @@ private fun SessionDetailScreen(
                     ) {
                         Text("HEART RATE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
                         Spacer(Modifier.height(10.dp))
-                        val onSurfaceColor = MaterialTheme.colorScheme.onSurface
-                        val surfaceColor = MaterialTheme.colorScheme.surface
-                        val accent = MaterialTheme.colorScheme.primary
-                        Canvas(Modifier.fillMaxWidth().height(190.dp)) {
-                            drawBpmChart(
-                                samples = currentSamples.map { HeartRateSample(it.bpm, it.timestampMs) },
-                                lineColor = accent,
-                                textColor = onSurfaceColor,
-                                surfaceColor = surfaceColor,
-                                zoneBoundariesBpm = zoneBoundaries,
-                                highlightLatest = false,
-                            )
-                        }
+                        InteractiveBpmChart(
+                            samples = currentSamples.map { HeartRateSample(it.bpm, it.timestampMs) },
+                            lineColor = MaterialTheme.colorScheme.primary,
+                            zoneSettings = zoneSettings,
+                            highlightLatest = false,
+                            zoneBoundariesBpm = zoneBoundaries,
+                            modifier = Modifier.fillMaxWidth().height(190.dp),
+                        )
                         Spacer(Modifier.height(4.dp))
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(timeLabel(session.startedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
@@ -1492,6 +1665,8 @@ private fun formatDuration(ms: Long): String {
 }
 
 private fun timeLabel(ms: Long): String = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(ms))
+
+private fun timeLabelWithSeconds(ms: Long): String = SimpleDateFormat("h:mm:ss a", Locale.getDefault()).format(Date(ms))
 
 private fun formatSessionSubtitle(session: SessionEntity): String {
     val dateFormat = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
