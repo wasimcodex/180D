@@ -30,10 +30,17 @@ class UserSettings(context: Context) {
         prefs.edit().putString(KEY_THEME_MODE, mode.name).apply()
     }
 
+    fun loadKeepScreenOn(): Boolean = prefs.getBoolean(KEY_KEEP_SCREEN_ON, false)
+
+    fun saveKeepScreenOn(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, enabled).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "user_settings"
         private const val KEY_AGE = "age"
         private const val KEY_RESTING_HR = "resting_hr"
         private const val KEY_THEME_MODE = "theme_mode"
+        private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
     }
 }

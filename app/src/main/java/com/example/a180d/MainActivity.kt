@@ -1,6 +1,7 @@
 package com.example.a180d
 
 import android.Manifest
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -10,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -60,6 +62,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -144,6 +147,7 @@ class MainActivity : ComponentActivity() {
             AppTheme(themeMode = themeMode) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     var zoneSettings by remember { mutableStateOf(userSettings.load()) }
+                    var keepScreenOnEnabled by remember { mutableStateOf(userSettings.loadKeepScreenOn()) }
                     val settings = zoneSettings
                     if (settings == null) {
                         ZoneSetupScreen(
@@ -160,6 +164,11 @@ class MainActivity : ComponentActivity() {
                             onSettingsChange = { zoneSettings = it },
                             onStartSession = { if (hasRequiredPermissions()) startSession() else permissionLauncher.launch(REQUIRED_PERMISSIONS) },
                             onEndSession = ::endSession,
+                            keepScreenOnEnabled = keepScreenOnEnabled,
+                            onToggleKeepScreenOn = {
+                                keepScreenOnEnabled = !keepScreenOnEnabled
+                                userSettings.saveKeepScreenOn(keepScreenOnEnabled)
+                            },
                             themeMode = themeMode,
                             onThemeModeChange = { mode ->
                                 userSettings.saveThemeMode(mode)
@@ -273,6 +282,8 @@ private fun AppRoot(
     onSettingsChange: (ZoneSettings) -> Unit,
     onStartSession: () -> Unit,
     onEndSession: () -> Unit,
+    keepScreenOnEnabled: Boolean,
+    onToggleKeepScreenOn: () -> Unit,
     themeMode: ThemeMode,
     onThemeModeChange: (ThemeMode) -> Unit,
 ) {
@@ -314,6 +325,8 @@ private fun AppRoot(
                 zoneSettings = zoneSettings,
                 onStartSession = onStartSession,
                 onEndSession = onEndSession,
+                keepScreenOnEnabled = keepScreenOnEnabled,
+                onToggleKeepScreenOn = onToggleKeepScreenOn,
                 onOpenMenu = { scope.launch { drawerState.open() } },
             )
         }
@@ -338,6 +351,8 @@ private fun HeartRateScreen(
     zoneSettings: ZoneSettings,
     onStartSession: () -> Unit,
     onEndSession: () -> Unit,
+    keepScreenOnEnabled: Boolean,
+    onToggleKeepScreenOn: () -> Unit,
     onOpenMenu: () -> Unit,
 ) {
     val connectionState by (service?.connectionState ?: EMPTY_STATE_FLOW).collectAsStateWithLifecycle()
@@ -357,6 +372,15 @@ private fun HeartRateScreen(
     val ageMs = sample?.let { now - it.timestampMs }
     val isStale = ageMs != null && ageMs > STALE_AFTER_MS
     val sessionActive = connectionState != ConnectionState.DISCONNECTED
+    val window = (LocalContext.current as Activity).window
+    DisposableEffect(sessionActive, keepScreenOnEnabled) {
+        if (sessionActive && keepScreenOnEnabled) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
     val elapsedText = if (sessionStartMs > 0L) BleHeartRateService.formatElapsed(now, sessionStartMs) else null
     val zone = sample?.let { HeartRateZones.computeZone(it.bpm, zoneSettings.age, zoneSettings.restingHr) }
 
@@ -367,7 +391,18 @@ private fun HeartRateScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SquareIconButton(onClick = onOpenMenu) { MenuGlyph(tint = MaterialTheme.colorScheme.onSurface) }
-            ConnectionStatusPill(connectionState)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (sessionActive) {
+                    SquareIconButton(onClick = onToggleKeepScreenOn) {
+                        KeepAwakeGlyph(
+                            tint = if (keepScreenOnEnabled) MaterialTheme.colorScheme.primary
+                                   else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                }
+                ConnectionStatusPill(connectionState)
+            }
         }
 
         Column(
@@ -1015,6 +1050,17 @@ private fun MenuGlyph(tint: Color, modifier: Modifier = Modifier.size(20.dp)) {
             val y = size.height * fractionOfHeight
             drawLine(tint, Offset(0f, y), Offset(size.width, y), strokeWidth, cap = StrokeCap.Round)
         }
+    }
+}
+
+@Composable
+private fun KeepAwakeGlyph(tint: Color, modifier: Modifier = Modifier.size(20.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.75.dp.toPx()
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+        drawArc(color = tint, startAngle = 200f, sweepAngle = 140f, useCenter = false, style = stroke)
+        drawArc(color = tint, startAngle = 20f, sweepAngle = 140f, useCenter = false, style = stroke)
+        drawCircle(color = tint, radius = size.minDimension * 0.14f, center = center)
     }
 }
 
