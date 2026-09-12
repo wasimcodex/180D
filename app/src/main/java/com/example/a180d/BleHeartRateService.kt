@@ -83,6 +83,10 @@ class BleHeartRateService : Service() {
     private val _latestSample = MutableStateFlow<HeartRateSample?>(null)
     val latestSample: StateFlow<HeartRateSample?> = _latestSample.asStateFlow()
 
+    private val _recentSamples = MutableStateFlow<List<HeartRateSample>>(emptyList())
+    /** Samples from the last [TREND_WINDOW_MS], for the live trend graph. */
+    val recentSamples: StateFlow<List<HeartRateSample>> = _recentSamples.asStateFlow()
+
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
@@ -176,6 +180,7 @@ class BleHeartRateService : Service() {
         targetDevice = null
         _connectionState.value = ConnectionState.DISCONNECTED
         _latestSample.value = null
+        _recentSamples.value = emptyList()
         serviceScope.launch { sessionRepository.endSession() }
     }
 
@@ -323,6 +328,8 @@ class BleHeartRateService : Service() {
                 val bpm = value?.let { parseHeartRateBpm(it) } ?: return
                 val sample = HeartRateSample(bpm, System.currentTimeMillis())
                 _latestSample.value = sample
+                _recentSamples.value = (_recentSamples.value + sample)
+                    .filter { sample.timestampMs - it.timestampMs <= TREND_WINDOW_MS }
                 serviceScope.launch { sessionRepository.recordSample(sample) }
             }
             SERVICE_CHANGED_UUID -> gatt.discoverServices()
@@ -484,6 +491,7 @@ class BleHeartRateService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val SCAN_TIMEOUT_MS = 8_000L
         private const val UNRECOVERABLE_AFTER_MS = 30_000L
+        private const val TREND_WINDOW_MS = 5 * 60_000L
         private val BACKOFF_SCHEDULE_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 30_000)
 
         private fun uuid16(shortHex: String): UUID =

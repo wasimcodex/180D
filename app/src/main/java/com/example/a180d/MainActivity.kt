@@ -20,12 +20,16 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -35,16 +39,23 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,10 +67,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -69,6 +89,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.a180d.ui.theme.AppTheme
+import com.example.a180d.ui.theme.HeroNumberStyle
+import com.example.a180d.ui.theme.SpaceGroteskFamily
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -76,6 +98,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private val REQUIRED_PERMISSIONS: Array<String> = buildList {
@@ -109,7 +132,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            AppTheme {
+            var themeMode by remember { mutableStateOf(userSettings.loadThemeMode()) }
+            AppTheme(themeMode = themeMode) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     var zoneSettings by remember { mutableStateOf(userSettings.load()) }
                     val settings = zoneSettings
@@ -121,22 +145,19 @@ class MainActivity : ComponentActivity() {
                             },
                         )
                     } else {
-                        var showHistory by remember { mutableStateOf(false) }
-                        if (showHistory) {
-                            SessionHistoryScreen(
-                                service = boundService,
-                                onBack = { showHistory = false },
-                            )
-                        } else {
-                            HeartRateScreen(
-                                service = boundService,
-                                zoneSettings = settings,
-                                onStartSession = { if (hasRequiredPermissions()) startSession() else permissionLauncher.launch(REQUIRED_PERMISSIONS) },
-                                onEndSession = ::endSession,
-                                onEditZoneSettings = { zoneSettings = null },
-                                onShowHistory = { showHistory = true },
-                            )
-                        }
+                        AppRoot(
+                            service = boundService,
+                            zoneSettings = settings,
+                            userSettings = userSettings,
+                            onSettingsChange = { zoneSettings = it },
+                            onStartSession = { if (hasRequiredPermissions()) startSession() else permissionLauncher.launch(REQUIRED_PERMISSIONS) },
+                            onEndSession = ::endSession,
+                            themeMode = themeMode,
+                            onThemeModeChange = { mode ->
+                                userSettings.saveThemeMode(mode)
+                                themeMode = mode
+                            },
+                        )
 
                         val pendingSession by (boundService?.sessionRepository?.pendingSession ?: EMPTY_PENDING_SESSION_FLOW)
                             .collectAsStateWithLifecycle()
@@ -183,10 +204,10 @@ class MainActivity : ComponentActivity() {
 
 private val EMPTY_STATE_FLOW = MutableStateFlow(ConnectionState.DISCONNECTED)
 private val EMPTY_SAMPLE_FLOW = MutableStateFlow<HeartRateSample?>(null)
+private val EMPTY_RECENT_SAMPLES_FLOW = MutableStateFlow<List<HeartRateSample>>(emptyList())
 private val EMPTY_ERROR_FLOW = MutableStateFlow<String?>(null)
 private val EMPTY_SESSION_START_FLOW = MutableStateFlow(0L)
 private val EMPTY_PENDING_SESSION_FLOW = MutableStateFlow<SessionEntity?>(null)
-private val EMPTY_SESSIONS_FLOW = MutableStateFlow<List<SessionEntity>>(emptyList())
 
 private const val STALE_AFTER_MS = 5_000L
 
@@ -235,17 +256,85 @@ private fun ZoneSetupScreen(onSave: (ZoneSettings) -> Unit) {
     }
 }
 
+/** Hosts the drawer (profile + session history) and swaps in the session-detail screen when a row is tapped. */
+@Composable
+private fun AppRoot(
+    service: BleHeartRateService?,
+    zoneSettings: ZoneSettings,
+    userSettings: UserSettings,
+    onSettingsChange: (ZoneSettings) -> Unit,
+    onStartSession: () -> Unit,
+    onEndSession: () -> Unit,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
+    val context = LocalContext.current
+    val historyRepository = remember { SessionRepository(context.applicationContext) }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    var selectedSession by remember { mutableStateOf<SessionEntity?>(null) }
+    var showEditProfile by remember { mutableStateOf(false) }
+
+    val session = selectedSession
+    if (session != null) {
+        SessionDetailScreen(
+            session = session,
+            repository = historyRepository,
+            zoneSettings = zoneSettings,
+            onBack = { selectedSession = null },
+        )
+    } else {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                AppDrawerContent(
+                    zoneSettings = zoneSettings,
+                    repository = historyRepository,
+                    onEditProfile = { showEditProfile = true },
+                    onSessionClick = {
+                        selectedSession = it
+                        scope.launch { drawerState.close() }
+                    },
+                    onClose = { scope.launch { drawerState.close() } },
+                    themeMode = themeMode,
+                    onThemeModeChange = onThemeModeChange,
+                )
+            },
+        ) {
+            HeartRateScreen(
+                service = service,
+                zoneSettings = zoneSettings,
+                onStartSession = onStartSession,
+                onEndSession = onEndSession,
+                onOpenMenu = { scope.launch { drawerState.open() } },
+            )
+        }
+    }
+
+    if (showEditProfile) {
+        EditProfileDialog(
+            current = zoneSettings,
+            onDismiss = { showEditProfile = false },
+            onSave = { updated ->
+                userSettings.save(updated)
+                onSettingsChange(updated)
+                showEditProfile = false
+            },
+        )
+    }
+}
+
 @Composable
 private fun HeartRateScreen(
     service: BleHeartRateService?,
     zoneSettings: ZoneSettings,
     onStartSession: () -> Unit,
     onEndSession: () -> Unit,
-    onEditZoneSettings: () -> Unit,
-    onShowHistory: () -> Unit,
+    onOpenMenu: () -> Unit,
 ) {
     val connectionState by (service?.connectionState ?: EMPTY_STATE_FLOW).collectAsStateWithLifecycle()
     val sample by (service?.latestSample ?: EMPTY_SAMPLE_FLOW).collectAsStateWithLifecycle()
+    val recentSamples by (service?.recentSamples ?: EMPTY_RECENT_SAMPLES_FLOW).collectAsStateWithLifecycle()
     val error by (service?.lastError ?: EMPTY_ERROR_FLOW).collectAsStateWithLifecycle()
     val sessionStartMs by (service?.sessionStartMs ?: EMPTY_SESSION_START_FLOW).collectAsStateWithLifecycle()
 
@@ -261,68 +350,94 @@ private fun HeartRateScreen(
     val isStale = ageMs != null && ageMs > STALE_AFTER_MS
     val sessionActive = connectionState != ConnectionState.DISCONNECTED
     val elapsedText = if (sessionStartMs > 0L) BleHeartRateService.formatElapsed(now, sessionStartMs) else null
+    val zone = sample?.let { HeartRateZones.computeZone(it.bpm, zoneSettings.age, zoneSettings.restingHr) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        val zone = sample?.let { HeartRateZones.computeZone(it.bpm, zoneSettings.age, zoneSettings.restingHr) }
+    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SquareIconButton(onClick = onOpenMenu) { MenuGlyph(tint = MaterialTheme.colorScheme.onSurface) }
+            ConnectionStatusPill(connectionState)
+        }
 
-        ZoneDial(
-            bpm = sample?.bpm,
-            zone = zone,
-            isStale = isStale,
-            modifier = Modifier
-                .fillMaxWidth(0.68f)
-                .aspectRatio(1f),
-        )
-
-        elapsedText?.let {
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = "Elapsed $it",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+        Column(
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            ZoneDial(
+                bpm = sample?.bpm,
+                zone = zone,
+                isStale = isStale,
+                modifier = Modifier.fillMaxWidth(0.72f).aspectRatio(1f),
             )
-        }
 
-        Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(14.dp))
 
-        if (isStale) {
-            ageMs?.let {
-                Text(
-                    text = "Stale — last reading ${it / 1000}s ago",
-                    color = MaterialTheme.colorScheme.error,
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                elapsedText?.let {
+                    InfoPill {
+                        ClockGlyph(tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
+                        Spacer(Modifier.width(7.dp))
+                        Text(it, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Text("·", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f))
+                    Spacer(Modifier.width(10.dp))
+                }
+                InfoPill {
+                    Text(
+                        text = zone?.let { "Zone %.1f · Fitbit Air".format(it) } ?: "Fitbit Air",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
+                    )
+                }
+            }
+
+            if (isStale) {
+                ageMs?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text(text = "Stale — last reading ${it / 1000}s ago", color = MaterialTheme.colorScheme.error)
+                }
+            }
+            error?.let {
                 Spacer(Modifier.height(8.dp))
+                Text(text = it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp))
             }
         }
 
-        ConnectionStatusRow(connectionState)
+        TrendGraphCard(samples = recentSamples, currentZone = zone, modifier = Modifier.padding(horizontal = 20.dp))
 
-        error?.let {
-            Spacer(Modifier.height(8.dp))
-            Text(text = it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(18.dp))
+
+        Box(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 30.dp)) {
+            SessionActionButton(active = sessionActive, onClick = if (sessionActive) onEndSession else onStartSession)
         }
+    }
+}
 
-        Spacer(Modifier.height(32.dp))
+@Composable
+private fun ConnectionStatusPill(connectionState: ConnectionState) {
+    val pulse by rememberInfiniteTransition(label = "statusPulse").animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(animation = tween(700), repeatMode = RepeatMode.Reverse),
+        label = "statusPulseAlpha",
+    )
+    val dotAlpha = if (connectionState.isInProgress()) pulse else 1f
 
-        Button(onClick = if (sessionActive) onEndSession else onStartSession) {
-            Text(if (sessionActive) "End session" else "Start session")
-        }
-
-        if (!sessionActive) {
-            Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onEditZoneSettings) {
-                Text("Edit age / resting HR")
-            }
-            TextButton(onClick = onShowHistory) {
-                Text("Session history")
-            }
-        }
+    InfoPill {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(connectionState.indicatorColor().copy(alpha = dotAlpha)),
+        )
+        Spacer(Modifier.width(7.dp))
+        Text(connectionState.toDisplayLabel(), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -351,28 +466,6 @@ private fun ConnectionState.isInProgress(): Boolean = this == ConnectionState.SC
     this == ConnectionState.DISCOVERING ||
     this == ConnectionState.RECONNECTING
 
-@Composable
-private fun ConnectionStatusRow(connectionState: ConnectionState) {
-    val pulse by rememberInfiniteTransition(label = "statusPulse").animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(animation = tween(700), repeatMode = RepeatMode.Reverse),
-        label = "statusPulseAlpha",
-    )
-    val dotAlpha = if (connectionState.isInProgress()) pulse else 1f
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(10.dp)
-                .clip(CircleShape)
-                .background(connectionState.indicatorColor().copy(alpha = dotAlpha)),
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(text = connectionState.toDisplayLabel())
-    }
-}
-
 private val ZONE_COLORS = listOf(
     Color(0xFF4FC3F7), // Zone 1
     Color(0xFF66BB6A), // Zone 2
@@ -381,21 +474,62 @@ private val ZONE_COLORS = listOf(
     Color(0xFFEF5350), // Zone 5
 )
 
+/** Deepened per-zone colors for text sitting on a light background, where the raw zone hue (esp. yellow) is too washed out to read. */
+private val ZONE_CHIP_TEXT_LIGHT = listOf(
+    Color(0xFF0288D1),
+    Color(0xFF2E7D32),
+    Color(0xFF8D6E00),
+    Color(0xFFE65100),
+    Color(0xFFC62828),
+)
+
+/** -1 when there's no reading yet; otherwise 0..4 into [ZONE_COLORS], using the same fraction-of-arc mapping as the dial's marker. */
+private fun zoneSegmentIndex(zone: Double?): Int {
+    if (zone == null) return -1
+    val fraction = ((zone - 1.0) / 5.0).coerceIn(0.0, 1.0)
+    return (fraction * ZONE_COLORS.size).toInt().coerceIn(0, ZONE_COLORS.size - 1)
+}
+
+private fun zoneSegmentColor(zone: Double?): Color {
+    val index = zoneSegmentIndex(zone)
+    return if (index >= 0) ZONE_COLORS[index] else Color(0xFF9E9E9E)
+}
+
+@Composable
+private fun zoneChipTextColor(index: Int): Color =
+    if (isSystemInDarkTheme()) ZONE_COLORS[index] else ZONE_CHIP_TEXT_LIGHT[index]
+
+@Composable
+private fun ZoneChip(index: Int, label: String, modifier: Modifier = Modifier) {
+    val bgAlpha = if (isSystemInDarkTheme()) 0.16f else 0.22f
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(ZONE_COLORS[index].copy(alpha = bgAlpha))
+            .padding(horizontal = 9.dp, vertical = 3.dp),
+    ) {
+        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = zoneChipTextColor(index))
+    }
+}
+
 private const val DIAL_START_ANGLE = 135f
 private const val DIAL_SWEEP_ANGLE = 270f
 private const val DIAL_SEGMENT_GAP_DEGREES = 3f
 
 /**
- * Circular zone gauge (270° sweep, gap at the bottom) with BPM/zone readout
- * in the center. Same fraction mapping as the old bar version
- * ((zone-1.0)/5.0 across zoneIndex 1..5 = Z1..Z5) just bent from a straight
- * line into an arc; below the Z1 floor (zone < 1.0) the marker pins to the
- * start of the arc rather than getting its own segment.
+ * Circular zone gauge (270° sweep, gap at the bottom) with BPM/zone readout in
+ * the center, plus a soft glow tinted to the current zone. Same fraction
+ * mapping as before ((zone-1.0)/5.0 across zoneIndex 1..5 = Z1..Z5), just
+ * restyled: theme-aware track/marker so it reads on both light and dark.
  */
 @Composable
 private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modifier = Modifier) {
     val alpha = if (isStale || zone == null) 0.35f else 1f
     val fraction = zone?.let { ((it - 1.0) / 5.0).coerceIn(0.0, 1.0).toFloat() }
+    val glowColor = zoneSegmentColor(zone)
+    val trackColor = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.08f)
+    val backgroundColor = MaterialTheme.colorScheme.background
+    val markerDotColor = MaterialTheme.colorScheme.onBackground
 
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -404,9 +538,24 @@ private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modif
             val arcSize = Size(arcDiameter, arcDiameter)
             val topLeft = Offset((size.width - arcDiameter) / 2f, (size.height - arcDiameter) / 2f)
             val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            val radius = arcDiameter / 2f
+            val arcCenter = Offset(topLeft.x + radius, topLeft.y + radius)
+
+            if (!isStale && zone != null) {
+                val glowRadius = radius * 1.35f
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(glowColor.copy(alpha = 0.18f), glowColor.copy(alpha = 0f)),
+                        center = arcCenter,
+                        radius = glowRadius,
+                    ),
+                    radius = glowRadius,
+                    center = arcCenter,
+                )
+            }
 
             drawArc(
-                color = Color.White.copy(alpha = 0.08f),
+                color = trackColor,
                 startAngle = DIAL_START_ANGLE,
                 sweepAngle = DIAL_SWEEP_ANGLE,
                 useCenter = false,
@@ -431,43 +580,918 @@ private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modif
 
             if (fraction != null) {
                 val angleRad = Math.toRadians((DIAL_START_ANGLE + fraction * DIAL_SWEEP_ANGLE).toDouble())
-                val radius = arcDiameter / 2f
-                val center = Offset(topLeft.x + radius, topLeft.y + radius)
                 val markerCenter = Offset(
-                    center.x + radius * cos(angleRad).toFloat(),
-                    center.y + radius * sin(angleRad).toFloat(),
+                    arcCenter.x + radius * cos(angleRad).toFloat(),
+                    arcCenter.y + radius * sin(angleRad).toFloat(),
                 )
-                val markerRadius = strokeWidth * 0.65f
-                drawCircle(color = Color.Black.copy(alpha = 0.55f), radius = markerRadius, center = markerCenter)
-                drawCircle(color = Color.White, radius = markerRadius * 0.6f, center = markerCenter)
+                val markerRadius = strokeWidth * 0.62f
+                drawCircle(color = backgroundColor, radius = markerRadius, center = markerCenter)
+                drawCircle(color = markerDotColor, radius = markerRadius * 0.6f, center = markerCenter)
             }
         }
 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = bpm?.toString() ?: "--",
-                fontSize = 76.sp,
-                fontWeight = FontWeight.Bold,
+                style = HeroNumberStyle,
                 color = if (isStale || bpm == null) {
-                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                    MaterialTheme.colorScheme.onBackground.copy(alpha = 0.35f)
                 } else {
-                    MaterialTheme.colorScheme.primary
+                    MaterialTheme.colorScheme.onBackground
                 },
             )
-            Text(text = "bpm", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(6.dp))
             Text(
-                text = zone?.let { "Zone ${"%.1f".format(it)}" } ?: "Zone --",
-                style = MaterialTheme.typography.titleMedium,
-                color = if (isStale || zone == null) {
-                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
-                } else {
-                    MaterialTheme.colorScheme.secondary
-                },
+                text = "BPM",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f),
+            )
+            Spacer(Modifier.height(12.dp))
+            if (zone != null && !isStale) {
+                val index = zoneSegmentIndex(zone)
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(ZONE_COLORS[index].copy(alpha = if (isSystemInDarkTheme()) 0.16f else 0.24f))
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                ) {
+                    Text("ZONE ${"%.1f".format(zone)}", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = zoneChipTextColor(index))
+                }
+            } else {
+                Text("Zone --", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.35f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrendGraphCard(samples: List<HeartRateSample>, currentZone: Double?, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(24.dp))
+            .padding(18.dp),
+    ) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("TREND", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+            Text("LAST 5 MIN", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f))
+        }
+        Spacer(Modifier.height(10.dp))
+        if (samples.size < 2) {
+            Box(Modifier.fillMaxWidth().height(96.dp), contentAlignment = Alignment.Center) {
+                Text(
+                    "Trend appears once a few readings arrive",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f),
+                    textAlign = TextAlign.Center,
+                )
+            }
+        } else {
+            val lineColor = zoneSegmentColor(currentZone)
+            val onSurfaceColor = MaterialTheme.colorScheme.onSurface
+            val surfaceColor = MaterialTheme.colorScheme.surface
+            Canvas(modifier = Modifier.fillMaxWidth().height(110.dp)) {
+                drawBpmChart(
+                    samples = samples,
+                    lineColor = lineColor,
+                    textColor = onSurfaceColor,
+                    surfaceColor = surfaceColor,
+                    highlightLatest = true,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Shared line/area BPM chart. With [zoneBoundariesBpm] it shades 5 zone bands
+ * behind the line (session-detail's full view); without it, draws two plain
+ * gridlines (the live trend card, where zone-accurate bands aren't worth the
+ * clutter at that size). [highlightLatest] marks the most recent point
+ * (live trend); otherwise the peak is marked (session detail).
+ */
+private fun DrawScope.drawBpmChart(
+    samples: List<HeartRateSample>,
+    lineColor: Color,
+    textColor: Color,
+    surfaceColor: Color,
+    zoneBoundariesBpm: List<Double>? = null,
+    highlightLatest: Boolean,
+) {
+    val minTs = samples.first().timestampMs
+    val maxTs = samples.last().timestampMs
+    val tsRange = (maxTs - minTs).coerceAtLeast(1L)
+    val dataMin = samples.minOf { it.bpm }
+    val dataMax = samples.maxOf { it.bpm }
+    val bpmMin = zoneBoundariesBpm?.first()?.coerceAtMost(dataMin - 4.0) ?: (dataMin - 4).toDouble()
+    val bpmMax = zoneBoundariesBpm?.last()?.coerceAtLeast(dataMax + 4.0) ?: (dataMax + 4).toDouble()
+    val bpmRange = (bpmMax - bpmMin).coerceAtLeast(1.0)
+
+    fun xFor(ts: Long) = size.width * (ts - minTs).toFloat() / tsRange
+    fun yFor(bpm: Double) = size.height - (size.height * ((bpm - bpmMin) / bpmRange)).toFloat()
+
+    if (zoneBoundariesBpm != null && zoneBoundariesBpm.size >= 6) {
+        val labels = listOf("Z1", "Z2", "Z3", "Z4", "Z5")
+        for (index in 0 until 5) {
+            val yTop = yFor(zoneBoundariesBpm[index + 1])
+            val yBottom = yFor(zoneBoundariesBpm[index])
+            drawRect(
+                color = ZONE_COLORS[index].copy(alpha = 0.08f),
+                topLeft = Offset(0f, yTop),
+                size = Size(size.width, (yBottom - yTop).coerceAtLeast(0f)),
+            )
+            drawContext.canvas.nativeCanvas.drawText(
+                labels[index],
+                size.width - 4.dp.toPx(),
+                yBottom - 4.dp.toPx(),
+                textPaint(textColor.copy(alpha = 0.4f), 9.sp.toPx(), android.graphics.Paint.Align.RIGHT),
+            )
+        }
+    } else {
+        listOf(0.25f, 0.75f).forEach { fractionOfHeight ->
+            val y = size.height * fractionOfHeight
+            drawLine(
+                color = textColor.copy(alpha = 0.12f),
+                start = Offset(0f, y),
+                end = Offset(size.width, y),
+                strokeWidth = 1.dp.toPx(),
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 4.dp.toPx())),
+            )
+            val bpmAtLine = (bpmMax - bpmRange * fractionOfHeight).roundToInt()
+            drawContext.canvas.nativeCanvas.drawText(
+                bpmAtLine.toString(),
+                size.width,
+                y + 3.dp.toPx(),
+                textPaint(textColor.copy(alpha = 0.5f), 9.sp.toPx(), android.graphics.Paint.Align.RIGHT),
+            )
+        }
+    }
+
+    val linePath = Path()
+    samples.forEachIndexed { index, sample ->
+        val x = xFor(sample.timestampMs)
+        val y = yFor(sample.bpm.toDouble())
+        if (index == 0) linePath.moveTo(x, y) else linePath.lineTo(x, y)
+    }
+    val fillPath = Path().apply {
+        addPath(linePath)
+        lineTo(size.width, size.height)
+        lineTo(0f, size.height)
+        close()
+    }
+    drawPath(fillPath, brush = Brush.verticalGradient(listOf(lineColor.copy(alpha = 0.3f), lineColor.copy(alpha = 0f))))
+    drawPath(linePath, color = lineColor, style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+
+    val highlight = if (highlightLatest) samples.last() else samples.maxByOrNull { it.bpm }!!
+    val hx = xFor(highlight.timestampMs)
+    val hy = yFor(highlight.bpm.toDouble())
+    drawCircle(surfaceColor, radius = 7.dp.toPx(), center = Offset(hx, hy))
+    drawCircle(lineColor, radius = 4.dp.toPx(), center = Offset(hx, hy))
+    drawContext.canvas.nativeCanvas.drawText(
+        highlight.bpm.toString(),
+        hx.coerceIn(16.dp.toPx(), size.width - 16.dp.toPx()),
+        (hy - 10.dp.toPx()).coerceAtLeast(12.dp.toPx()),
+        textPaint(textColor, 12.sp.toPx(), android.graphics.Paint.Align.CENTER, bold = true),
+    )
+}
+
+private fun textPaint(color: Color, textSizePx: Float, align: android.graphics.Paint.Align, bold: Boolean = false) =
+    android.graphics.Paint().apply {
+        this.color = color.toArgb()
+        this.textSize = textSizePx
+        this.textAlign = align
+        this.isAntiAlias = true
+        this.isFakeBoldText = bold
+    }
+
+@Composable
+private fun SessionActionButton(active: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    if (active) {
+        Row(
+            modifier = modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(MaterialTheme.colorScheme.surface)
+                .border(1.5.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.4f), RoundedCornerShape(999.dp))
+                .clickable(onClick = onClick),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(11.dp).clip(RoundedCornerShape(3.dp)).background(MaterialTheme.colorScheme.error))
+            Spacer(Modifier.width(10.dp))
+            Text("End Session", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface)
+        }
+    } else {
+        Row(
+            modifier = modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(MaterialTheme.colorScheme.primary)
+                .clickable(onClick = onClick),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Start Session", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = MaterialTheme.colorScheme.onPrimary)
+        }
+    }
+}
+
+@Composable
+private fun SquareIconButton(onClick: () -> Unit, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Box(
+        modifier = modifier
+            .size(44.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+        content = { content() },
+    )
+}
+
+@Composable
+private fun InfoPill(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(999.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        content = { content() },
+    )
+}
+
+// ---- Hand-drawn glyphs (no icon-font dependency; thin-stroke, 24x24-authored) ----
+
+@Composable
+private fun MenuGlyph(tint: Color, modifier: Modifier = Modifier.size(20.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.75.dp.toPx()
+        listOf(0.22f, 0.5f, 0.78f).forEach { fractionOfHeight ->
+            val y = size.height * fractionOfHeight
+            drawLine(tint, Offset(0f, y), Offset(size.width, y), strokeWidth, cap = StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
+private fun CloseGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.9.dp.toPx()
+        drawLine(tint, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth, cap = StrokeCap.Round)
+        drawLine(tint, Offset(size.width, 0f), Offset(0f, size.height), strokeWidth, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun ChevronLeftGlyph(tint: Color, modifier: Modifier = Modifier.size(18.dp)) {
+    Canvas(modifier = modifier) {
+        val path = Path().apply {
+            moveTo(size.width * 0.62f, size.height * 0.1f)
+            lineTo(size.width * 0.3f, size.height * 0.5f)
+            lineTo(size.width * 0.62f, size.height * 0.9f)
+        }
+        drawPath(path, tint, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun ClockGlyph(tint: Color, modifier: Modifier = Modifier.size(14.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.6.dp.toPx()
+        val radius = size.minDimension / 2f - strokeWidth
+        drawCircle(tint, radius = radius, center = center, style = Stroke(width = strokeWidth))
+        drawLine(tint, center, Offset(center.x, center.y - radius * 0.55f), strokeWidth, cap = StrokeCap.Round)
+        drawLine(tint, center, Offset(center.x + radius * 0.4f, center.y + radius * 0.15f), strokeWidth, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun PencilGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val s = size.width / 24f
+        fun p(x: Float, y: Float) = Offset(x * s, y * s)
+        val strokeWidth = 1.9.dp.toPx()
+        drawLine(tint, p(12f, 20f), p(21f, 20f), strokeWidth, cap = StrokeCap.Round)
+        val body = Path().apply {
+            moveTo(16.5f * s, 3.5f * s)
+            quadraticTo(19.6f * s, 3.2f * s, 19.6f * s, 6.6f * s)
+            lineTo(7f * s, 19f * s)
+            lineTo(3f * s, 20f * s)
+            lineTo(4f * s, 16f * s)
+            close()
+        }
+        drawPath(body, tint, style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun DownloadGlyph(tint: Color, modifier: Modifier = Modifier.size(15.dp)) {
+    Canvas(modifier = modifier) {
+        val s = size.width / 24f
+        fun p(x: Float, y: Float) = Offset(x * s, y * s)
+        val strokeWidth = 1.9.dp.toPx()
+        drawLine(tint, p(12f, 3f), p(12f, 15f), strokeWidth, cap = StrokeCap.Round)
+        val arrow = Path().apply {
+            moveTo(7f * s, 10f * s)
+            lineTo(12f * s, 15f * s)
+            lineTo(17f * s, 10f * s)
+        }
+        drawPath(arrow, tint, style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        drawLine(tint, p(5f, 21f), p(19f, 21f), strokeWidth, cap = StrokeCap.Round)
+    }
+}
+
+@Composable
+private fun TrashGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val s = size.width / 24f
+        fun p(x: Float, y: Float) = Offset(x * s, y * s)
+        val strokeWidth = 1.9.dp.toPx()
+        drawLine(tint, p(4f, 7f), p(20f, 7f), strokeWidth, cap = StrokeCap.Round)
+        drawLine(tint, p(10f, 11f), p(10f, 17f), strokeWidth, cap = StrokeCap.Round)
+        drawLine(tint, p(14f, 11f), p(14f, 17f), strokeWidth, cap = StrokeCap.Round)
+        val bin = Path().apply {
+            moveTo(6f * s, 7f * s)
+            lineTo(7f * s, 20f * s)
+            quadraticTo(7f * s, 22f * s, 9f * s, 22f * s)
+            lineTo(15f * s, 22f * s)
+            quadraticTo(17f * s, 22f * s, 17f * s, 20f * s)
+            lineTo(18f * s, 7f * s)
+        }
+        drawPath(bin, tint, style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        val lid = Path().apply {
+            moveTo(9f * s, 7f * s)
+            lineTo(9f * s, 4f * s)
+            quadraticTo(9f * s, 3f * s, 10f * s, 3f * s)
+            lineTo(14f * s, 3f * s)
+            quadraticTo(15f * s, 3f * s, 15f * s, 4f * s)
+            lineTo(15f * s, 7f * s)
+        }
+        drawPath(lid, tint, style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun HeartGlyph(tint: Color, modifier: Modifier = Modifier.size(22.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.75.dp.toPx()
+        val cx = size.width / 2f
+        val topY = size.height * 0.32f
+        val w = size.width * 0.42f
+        val path = Path().apply {
+            moveTo(cx, size.height * 0.82f)
+            cubicTo(cx - w, size.height * 0.55f, cx - w, topY, cx - w * 0.42f, topY)
+            cubicTo(cx - w * 0.1f, topY, cx, topY + size.height * 0.12f, cx, topY + size.height * 0.2f)
+            cubicTo(cx, topY + size.height * 0.12f, cx + w * 0.1f, topY, cx + w * 0.42f, topY)
+            cubicTo(cx + w, topY, cx + w, size.height * 0.55f, cx, size.height * 0.82f)
+            close()
+        }
+        drawPath(path, tint, style = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
+private fun SunGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.6.dp.toPx()
+        val radius = size.minDimension * 0.22f
+        drawCircle(tint, radius = radius, center = center, style = Stroke(width = strokeWidth))
+        val rayInner = radius + size.minDimension * 0.08f
+        val rayOuter = rayInner + size.minDimension * 0.14f
+        for (i in 0 until 8) {
+            val angle = Math.toRadians((i * 45).toDouble())
+            val cosA = cos(angle).toFloat()
+            val sinA = sin(angle).toFloat()
+            drawLine(
+                tint,
+                Offset(center.x + rayInner * cosA, center.y + rayInner * sinA),
+                Offset(center.x + rayOuter * cosA, center.y + rayOuter * sinA),
+                strokeWidth,
+                cap = StrokeCap.Round,
             )
         }
     }
 }
+
+@Composable
+private fun MoonGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val radius = size.minDimension * 0.32f
+        val fullCircle = Path().apply { addOval(Rect(center = center, radius = radius)) }
+        val cutout = Path().apply {
+            addOval(Rect(center = Offset(center.x + radius * 0.55f, center.y - radius * 0.4f), radius = radius * 0.82f))
+        }
+        val crescent = Path().apply { op(fullCircle, cutout, PathOperation.Difference) }
+        drawPath(crescent, tint)
+    }
+}
+
+@Composable
+private fun AutoGlyph(tint: Color, modifier: Modifier = Modifier.size(16.dp)) {
+    Canvas(modifier = modifier) {
+        val radius = size.minDimension * 0.32f
+        val strokeWidth = 1.6.dp.toPx()
+        drawCircle(tint, radius = radius, center = center, style = Stroke(width = strokeWidth))
+        val halfDisc = Path().apply {
+            addArc(Rect(center = center, radius = radius), startAngleDegrees = 90f, sweepAngleDegrees = 180f)
+            close()
+        }
+        drawPath(halfDisc, tint)
+    }
+}
+
+@Composable
+private fun ThemeModeSelector(selected: ThemeMode, onSelect: (ThemeMode) -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp))
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        ThemeModeOption(label = "System", mode = ThemeMode.SYSTEM, selected = selected, onSelect = onSelect, modifier = Modifier.weight(1f)) { AutoGlyph(tint = it) }
+        ThemeModeOption(label = "Light", mode = ThemeMode.LIGHT, selected = selected, onSelect = onSelect, modifier = Modifier.weight(1f)) { SunGlyph(tint = it) }
+        ThemeModeOption(label = "Dark", mode = ThemeMode.DARK, selected = selected, onSelect = onSelect, modifier = Modifier.weight(1f)) { MoonGlyph(tint = it) }
+    }
+}
+
+@Composable
+private fun ThemeModeOption(
+    label: String,
+    mode: ThemeMode,
+    selected: ThemeMode,
+    onSelect: (ThemeMode) -> Unit,
+    modifier: Modifier = Modifier,
+    icon: @Composable (Color) -> Unit,
+) {
+    val isSelected = selected == mode
+    val tint = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(11.dp))
+            .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
+            .clickable { onSelect(mode) }
+            .padding(vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        icon(tint)
+        Spacer(Modifier.height(4.dp))
+        Text(label, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = tint)
+    }
+}
+
+// ---- Side menu: profile edit + session history table ----
+
+@Composable
+private fun AppDrawerContent(
+    zoneSettings: ZoneSettings,
+    repository: SessionRepository,
+    onEditProfile: () -> Unit,
+    onSessionClick: (SessionEntity) -> Unit,
+    onClose: () -> Unit,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
+    val summaries by repository.sessionSummaries.collectAsStateWithLifecycle(initialValue = emptyList())
+
+    ModalDrawerSheet(
+        drawerContainerColor = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.width(320.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .padding(horizontal = 22.dp, vertical = 16.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(46.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                        .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) { HeartGlyph(tint = MaterialTheme.colorScheme.primary) }
+                SquareIconButton(onClick = onClose) { CloseGlyph(tint = MaterialTheme.colorScheme.onSurface) }
+            }
+
+            Spacer(Modifier.height(18.dp))
+            Text("Your Profile", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(14.dp))
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp),
+            ) {
+                ProfileRow(label = "AGE", value = zoneSettings.age.toString(), onEdit = onEditProfile)
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                ProfileRow(label = "RESTING HR", value = "${zoneSettings.restingHr} bpm", onEdit = onEditProfile)
+            }
+
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+            Spacer(Modifier.height(16.dp))
+
+            Text("Appearance", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            ThemeModeSelector(selected = themeMode, onSelect = onThemeModeChange)
+
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+            Spacer(Modifier.height(16.dp))
+
+            Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text = if (summaries.isEmpty()) "No sessions yet" else "${summaries.size} sessions logged",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
+            )
+            Spacer(Modifier.height(10.dp))
+
+            if (summaries.isEmpty()) {
+                Text(
+                    "Sessions you save will show up here as a table.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
+            } else {
+                SessionTableHeader()
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(summaries, key = { it.session.id }) { summary ->
+                        SessionTableRow(summary = summary, zoneSettings = zoneSettings, onClick = { onSessionClick(summary.session) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileRow(label: String, value: String, onEdit: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column {
+            Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+            Spacer(Modifier.height(3.dp))
+            Text(value, fontFamily = SpaceGroteskFamily, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+        }
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                .clickable(onClick = onEdit),
+            contentAlignment = Alignment.Center,
+        ) { PencilGlyph(tint = MaterialTheme.colorScheme.primary) }
+    }
+}
+
+@Composable
+private fun SessionTableHeader() {
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Text("DATE", modifier = Modifier.weight(1.5f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("DURATION", modifier = Modifier.weight(1.1f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("AVG", modifier = Modifier.weight(0.7f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("ZONE", modifier = Modifier.weight(0.65f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+    }
+}
+
+@Composable
+private fun SessionTableRow(summary: SessionSummary, zoneSettings: ZoneSettings, onClick: () -> Unit) {
+    val dateFormat = remember { SimpleDateFormat("MMM d", Locale.getDefault()) }
+    val timeFormat = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
+    val avgBpm = summary.stats?.avgBpm?.roundToInt()
+    val avgZone = avgBpm?.let { HeartRateZones.computeZone(it, zoneSettings.age, zoneSettings.restingHr) }
+    val zoneIndex = zoneSegmentIndex(avgZone)
+
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1.5f)) {
+                Text(dateFormat.format(Date(summary.session.startedAtMs)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(timeFormat.format(Date(summary.session.startedAtMs)), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+            }
+            Text(
+                formatDuration(summary.session.endedAtMs - summary.session.startedAtMs),
+                modifier = Modifier.weight(1.1f),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+            )
+            Text(
+                avgBpm?.toString() ?: "--",
+                modifier = Modifier.weight(0.7f),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+            )
+            Box(Modifier.weight(0.65f)) {
+                if (zoneIndex >= 0) {
+                    ZoneChip(index = zoneIndex, label = "Z${zoneIndex + 1}")
+                } else {
+                    Text("--", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+                }
+            }
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+    }
+}
+
+@Composable
+private fun EditProfileDialog(current: ZoneSettings, onDismiss: () -> Unit, onSave: (ZoneSettings) -> Unit) {
+    var ageText by remember { mutableStateOf(current.age.toString()) }
+    var restingHrText by remember { mutableStateOf(current.restingHr.toString()) }
+    val age = ageText.toIntOrNull()
+    val restingHr = restingHrText.toIntOrNull()
+    val isValid = age != null && age in 1..120 && restingHr != null && restingHr in 30..120
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit profile") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = ageText,
+                    onValueChange = { ageText = it.filter(Char::isDigit).take(3) },
+                    label = { Text("Age") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = restingHrText,
+                    onValueChange = { restingHrText = it.filter(Char::isDigit).take(3) },
+                    label = { Text("Resting heart rate (bpm)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(ZoneSettings(age!!, restingHr!!)) }, enabled = isValid) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+// ---- Session detail: full graph + time-in-zone ----
+
+@Composable
+private fun SessionDetailScreen(
+    session: SessionEntity,
+    repository: SessionRepository,
+    zoneSettings: ZoneSettings,
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var samples by remember(session.id) { mutableStateOf<List<SampleEntity>?>(null) }
+    var stats by remember(session.id) { mutableStateOf<SessionStats?>(null) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    LaunchedEffect(session.id) {
+        stats = repository.statsForSession(session.id)
+        samples = repository.samplesForSession(session.id)
+    }
+
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SquareIconButton(onClick = onBack) { ChevronLeftGlyph(tint = MaterialTheme.colorScheme.onSurface) }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(session.title.ifBlank { "Session" }, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(formatSessionSubtitle(session), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+            }
+            SquareIconButton(onClick = { scope.launch { shareCsv(context, repository.exportCsv(session)) } }) {
+                DownloadGlyph(tint = MaterialTheme.colorScheme.onSurface)
+            }
+        }
+
+        val currentSamples = samples
+        when {
+            currentSamples == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Loading…", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+            }
+            currentSamples.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No samples recorded for this session.", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+            }
+            else -> {
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        StatTile("AVG", stats?.avgBpm?.roundToInt()?.toString() ?: "--", Modifier.weight(1f))
+                        StatTile("MAX", stats?.maxBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(3))
+                        StatTile("MIN", stats?.minBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(0))
+                        StatTile("DURATION", formatDuration(session.endedAtMs - session.startedAtMs), Modifier.weight(1f))
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    val zoneBoundaries = remember(zoneSettings) {
+                        HeartRateZones.zoneBandBoundariesBpm(zoneSettings.age, zoneSettings.restingHr)
+                    }
+                    Column(
+                        modifier = Modifier
+                            .padding(horizontal = 20.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(24.dp))
+                            .background(MaterialTheme.colorScheme.surface)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(24.dp))
+                            .padding(18.dp),
+                    ) {
+                        Text("HEART RATE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+                        Spacer(Modifier.height(10.dp))
+                        val onSurfaceColor = MaterialTheme.colorScheme.onSurface
+                        val surfaceColor = MaterialTheme.colorScheme.surface
+                        val accent = MaterialTheme.colorScheme.primary
+                        Canvas(Modifier.fillMaxWidth().height(190.dp)) {
+                            drawBpmChart(
+                                samples = currentSamples.map { HeartRateSample(it.bpm, it.timestampMs) },
+                                lineColor = accent,
+                                textColor = onSurfaceColor,
+                                surfaceColor = surfaceColor,
+                                zoneBoundariesBpm = zoneBoundaries,
+                                highlightLatest = false,
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(timeLabel(session.startedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+                            Text(timeLabel(session.endedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+                        }
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+
+                    val breakdown = remember(currentSamples, zoneSettings) { zoneBreakdownMs(currentSamples, zoneSettings) }
+                    ZoneBreakdownCard(breakdown, modifier = Modifier.padding(horizontal = 20.dp))
+                    Spacer(Modifier.height(20.dp))
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(999.dp))
+                            .clickable { scope.launch { shareCsv(context, repository.exportCsv(session)) } },
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        DownloadGlyph(tint = MaterialTheme.colorScheme.onSurface)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Export CSV", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .border(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.3f), RoundedCornerShape(999.dp))
+                            .clickable { showDeleteConfirm = true },
+                        contentAlignment = Alignment.Center,
+                    ) { TrashGlyph(tint = MaterialTheme.colorScheme.error) }
+                }
+            }
+        }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete this session?") },
+            text = { Text("This permanently removes the recorded samples. This can't be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteConfirm = false
+                    scope.launch {
+                        repository.deleteSession(session)
+                        onBack()
+                    }
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun StatTile(label: String, value: String, modifier: Modifier = Modifier, color: Color = Color.Unspecified) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
+            .padding(vertical = 12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(label, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+        Spacer(Modifier.height(4.dp))
+        Text(
+            value,
+            fontFamily = SpaceGroteskFamily,
+            fontWeight = FontWeight.Bold,
+            fontSize = 19.sp,
+            color = if (color == Color.Unspecified) MaterialTheme.colorScheme.onSurface else color,
+        )
+    }
+}
+
+/** Bucket time between consecutive samples into the zone of the later sample; gaps (e.g. a reconnect) are capped at [STALE_AFTER_MS] so they don't skew one zone. */
+private fun zoneBreakdownMs(samples: List<SampleEntity>, settings: ZoneSettings): LongArray {
+    val totals = LongArray(5)
+    for (index in 1 until samples.size) {
+        val previous = samples[index - 1]
+        val current = samples[index]
+        val delta = (current.timestampMs - previous.timestampMs).coerceIn(0L, STALE_AFTER_MS)
+        if (delta <= 0L) continue
+        val zone = HeartRateZones.computeZone(current.bpm, settings.age, settings.restingHr)
+        totals[zoneSegmentIndex(zone).coerceAtLeast(0)] += delta
+    }
+    return totals
+}
+
+@Composable
+private fun ZoneBreakdownCard(breakdownMs: LongArray, modifier: Modifier = Modifier) {
+    val total = breakdownMs.sum().coerceAtLeast(1L)
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(24.dp))
+            .padding(18.dp),
+    ) {
+        Text("TIME IN ZONE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth().height(14.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            breakdownMs.forEachIndexed { index, ms ->
+                val segmentWeight = (ms.toFloat() / total).coerceAtLeast(0.002f)
+                Box(
+                    modifier = Modifier
+                        .weight(segmentWeight)
+                        .fillMaxHeight()
+                        .clip(
+                            RoundedCornerShape(
+                                topStart = if (index == 0) 7.dp else 0.dp,
+                                bottomStart = if (index == 0) 7.dp else 0.dp,
+                                topEnd = if (index == breakdownMs.lastIndex) 7.dp else 0.dp,
+                                bottomEnd = if (index == breakdownMs.lastIndex) 7.dp else 0.dp,
+                            ),
+                        )
+                        .background(ZONE_COLORS[index]),
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            breakdownMs.forEachIndexed { index, ms ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(8.dp).clip(RoundedCornerShape(2.dp)).background(ZONE_COLORS[index]))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Z${index + 1} · ${formatDuration(ms)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f))
+                }
+            }
+        }
+    }
+}
+
+private fun formatDuration(ms: Long): String {
+    val totalSec = (ms / 1000).coerceAtLeast(0)
+    return "%d:%02d".format(totalSec / 60, totalSec % 60)
+}
+
+private fun timeLabel(ms: Long): String = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(ms))
 
 private fun formatSessionSubtitle(session: SessionEntity): String {
     val dateFormat = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
@@ -506,69 +1530,4 @@ private fun SaveSessionDialog(session: SessionEntity, onDiscard: () -> Unit, onS
         confirmButton = { TextButton(onClick = { onSave(titleText) }) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDiscard) { Text("Discard") } },
     )
-}
-
-@Composable
-private fun SessionHistoryScreen(service: BleHeartRateService?, onBack: () -> Unit) {
-    val sessions by (service?.sessionRepository?.sessions ?: EMPTY_SESSIONS_FLOW)
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .statusBarsPadding()
-            .padding(24.dp),
-    ) {
-        TextButton(onClick = onBack) { Text("← Back") }
-        Spacer(Modifier.height(8.dp))
-        Text(text = "Session history", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(16.dp))
-
-        if (sessions.isEmpty()) {
-            Text(
-                text = "No saved sessions yet.",
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-            )
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(sessions, key = { it.id }) { session ->
-                    SessionRow(
-                        session = session,
-                        onExport = {
-                            scope.launch {
-                                val uri = service?.sessionRepository?.exportCsv(session) ?: return@launch
-                                shareCsv(context, uri)
-                            }
-                        },
-                        onDelete = { scope.launch { service?.sessionRepository?.deleteSession(session) } },
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SessionRow(session: SessionEntity, onExport: () -> Unit, onDelete: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
-            .padding(16.dp),
-    ) {
-        Text(text = session.title, style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text = formatSessionSubtitle(session),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-        )
-        Spacer(Modifier.height(8.dp))
-        Row {
-            TextButton(onClick = onExport) { Text("Export CSV") }
-            TextButton(onClick = onDelete) { Text("Delete") }
-        }
-    }
 }

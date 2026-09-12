@@ -38,4 +38,24 @@ object HeartRateZones {
         }
         return 5.0
     }
+
+    /**
+     * The 6 BPM boundary points of the 5 display zones (Z1 floor..Z5 ceiling),
+     * for shading a chart. The sub-Z1 band (resting HR up to the 50% mark) is
+     * folded into Z1 rather than broken out on its own, matching how the dial
+     * already renders it: fractions below 1.0 pin to the start of the Z1 arc
+     * segment (see [computeZone]'s doc and the dial's fraction clamp).
+     */
+    fun zoneBandBoundariesBpm(age: Int, restingHr: Int): List<Double> {
+        val hrMax = 208.0 - 0.7 * age
+        val hrReserve = (hrMax - restingHr).coerceAtLeast(0.0)
+        return listOf(
+            restingHr.toDouble(),
+            hrReserve * 0.60 + restingHr,
+            hrReserve * 0.70 + restingHr,
+            hrReserve * 0.80 + restingHr,
+            hrReserve * 0.90 + restingHr,
+            hrMax,
+        )
+    }
 }

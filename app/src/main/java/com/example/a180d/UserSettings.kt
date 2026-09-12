@@ -4,7 +4,9 @@ import android.content.Context
 
 data class ZoneSettings(val age: Int, val restingHr: Int)
 
-/** Persists the age/resting-HR inputs the Karvonen zone calculation needs. Never guessed or hardcoded. */
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
+/** Persists the age/resting-HR inputs the Karvonen zone calculation needs, and the display theme choice. Never guessed or hardcoded. */
 class UserSettings(context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -21,9 +23,17 @@ class UserSettings(context: Context) {
             .apply()
     }
 
+    fun loadThemeMode(): ThemeMode =
+        prefs.getString(KEY_THEME_MODE, null)?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() } ?: ThemeMode.SYSTEM
+
+    fun saveThemeMode(mode: ThemeMode) {
+        prefs.edit().putString(KEY_THEME_MODE, mode.name).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "user_settings"
         private const val KEY_AGE = "age"
         private const val KEY_RESTING_HR = "resting_hr"
+        private const val KEY_THEME_MODE = "theme_mode"
     }
 }

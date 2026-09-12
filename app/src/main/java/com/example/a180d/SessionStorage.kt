@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -35,6 +36,8 @@ data class SessionEntity(
     val startedAtMs: Long,
     val endedAtMs: Long,
 )
+
+data class SessionSummary(val session: SessionEntity, val stats: SessionStats?)
 
 @Entity(
     tableName = "heart_rate_samples",
@@ -73,6 +76,8 @@ interface SessionDao {
     suspend fun getById(id: Long): SessionEntity?
 }
 
+data class SessionStats(val sessionId: Long, val avgBpm: Double, val maxBpm: Int, val minBpm: Int)
+
 @Dao
 interface SampleDao {
     @Insert
@@ -83,6 +88,12 @@ interface SampleDao {
 
     @Query("SELECT COUNT(*) FROM heart_rate_samples WHERE sessionId = :sessionId")
     suspend fun countForSession(sessionId: Long): Int
+
+    @Query("SELECT sessionId, AVG(bpm) AS avgBpm, MAX(bpm) AS maxBpm, MIN(bpm) AS minBpm FROM heart_rate_samples GROUP BY sessionId")
+    fun observeStats(): Flow<List<SessionStats>>
+
+    @Query("SELECT sessionId, AVG(bpm) AS avgBpm, MAX(bpm) AS maxBpm, MIN(bpm) AS minBpm FROM heart_rate_samples WHERE sessionId = :sessionId GROUP BY sessionId")
+    suspend fun getStatsForSession(sessionId: Long): SessionStats?
 }
 
 @Database(entities = [SessionEntity::class, SampleEntity::class], version = 1, exportSchema = false)
@@ -121,6 +132,12 @@ class SessionRepository(context: Context) {
     val pendingSession: StateFlow<SessionEntity?> = _pendingSession.asStateFlow()
 
     val sessions: Flow<List<SessionEntity>> = database.sessionDao().observeAll()
+
+    /** Sessions paired with their aggregate BPM stats, for the history table. */
+    val sessionSummaries: Flow<List<SessionSummary>> = combine(sessions, database.sampleDao().observeStats()) { sessionList, statsList ->
+        val statsById = statsList.associateBy { it.sessionId }
+        sessionList.map { SessionSummary(it, statsById[it.id]) }
+    }
 
     suspend fun startSession(startedAtMs: Long) {
         currentSessionId = database.sessionDao().insert(
@@ -167,6 +184,12 @@ class SessionRepository(context: Context) {
 
     suspend fun deleteSession(session: SessionEntity) {
         database.sessionDao().delete(session)
+    }
+
+    suspend fun statsForSession(sessionId: Long): SessionStats? = database.sampleDao().getStatsForSession(sessionId)
+
+    suspend fun samplesForSession(sessionId: Long): List<SampleEntity> = withContext(Dispatchers.IO) {
+        database.sampleDao().getForSession(sessionId)
     }
 
     /** Writes the session's samples to a CSV in the cache dir and returns a FileProvider URI for sharing. */
