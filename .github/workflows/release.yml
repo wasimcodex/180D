@@ -40,3 +40,4 @@ jobs:
         with:
           files: app/build/outputs/apk/release/app-release.apk
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
