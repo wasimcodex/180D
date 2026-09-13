@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,6 +16,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -37,6 +39,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -89,6 +92,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -239,7 +243,9 @@ private fun ZoneSetupScreen(onSave: (ZoneSettings) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState())
+            .imePadding(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -383,6 +389,7 @@ private fun HeartRateScreen(
     }
     val elapsedText = if (sessionStartMs > 0L) BleHeartRateService.formatElapsed(now, sessionStartMs) else null
     val zone = sample?.let { HeartRateZones.computeZone(it.bpm, zoneSettings.age, zoneSettings.restingHr) }
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
     Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
         Row(
@@ -405,6 +412,60 @@ private fun HeartRateScreen(
             }
         }
 
+        Crossfade(
+            targetState = isLandscape,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            animationSpec = tween(300),
+            label = "heartRateBodyOrientation",
+        ) { landscape ->
+            if (landscape) {
+                HeartRateLandscapeBody(
+                    sample = sample,
+                    zone = zone,
+                    isStale = isStale,
+                    ageMs = ageMs,
+                    elapsedText = elapsedText,
+                    error = error,
+                    recentSamples = recentSamples,
+                    zoneSettings = zoneSettings,
+                    sessionActive = sessionActive,
+                    onStartSession = onStartSession,
+                    onEndSession = onEndSession,
+                )
+            } else {
+                HeartRatePortraitBody(
+                    sample = sample,
+                    zone = zone,
+                    isStale = isStale,
+                    ageMs = ageMs,
+                    elapsedText = elapsedText,
+                    error = error,
+                    recentSamples = recentSamples,
+                    zoneSettings = zoneSettings,
+                    sessionActive = sessionActive,
+                    onStartSession = onStartSession,
+                    onEndSession = onEndSession,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HeartRatePortraitBody(
+    sample: HeartRateSample?,
+    zone: Double?,
+    isStale: Boolean,
+    ageMs: Long?,
+    elapsedText: String?,
+    error: String?,
+    recentSamples: List<HeartRateSample>,
+    zoneSettings: ZoneSettings,
+    sessionActive: Boolean,
+    onStartSession: () -> Unit,
+    onEndSession: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.weight(1f).fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -419,26 +480,7 @@ private fun HeartRateScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                elapsedText?.let {
-                    InfoPill {
-                        ClockGlyph(tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
-                        Spacer(Modifier.width(7.dp))
-                        Text(it, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    Text("·", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f))
-                    Spacer(Modifier.width(10.dp))
-                }
-                InfoPill {
-                    Text(
-                        text = zone?.let { "Zone %.1f · Fitbit Air".format(it) } ?: "Fitbit Air",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
-                    )
-                }
-            }
+            HeartRateInfoRow(elapsedText = elapsedText, zone = zone)
 
             if (isStale) {
                 ageMs?.let {
@@ -458,6 +500,91 @@ private fun HeartRateScreen(
 
         Box(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 30.dp)) {
             SessionActionButton(active = sessionActive, onClick = if (sessionActive) onEndSession else onStartSession)
+        }
+    }
+}
+
+@Composable
+private fun HeartRateLandscapeBody(
+    sample: HeartRateSample?,
+    zone: Double?,
+    isStale: Boolean,
+    ageMs: Long?,
+    elapsedText: String?,
+    error: String?,
+    recentSamples: List<HeartRateSample>,
+    zoneSettings: ZoneSettings,
+    sessionActive: Boolean,
+    onStartSession: () -> Unit,
+    onEndSession: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(
+            modifier = Modifier.weight(0.45f).fillMaxHeight(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            ZoneDial(
+                bpm = sample?.bpm,
+                zone = zone,
+                isStale = isStale,
+                modifier = Modifier.fillMaxHeight(0.75f).aspectRatio(1f),
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            HeartRateInfoRow(elapsedText = elapsedText, zone = zone)
+
+            if (isStale) {
+                ageMs?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text(text = "Stale — last reading ${it / 1000}s ago", color = MaterialTheme.colorScheme.error)
+                }
+            }
+            error?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(text = it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp))
+            }
+        }
+
+        Spacer(Modifier.width(20.dp))
+
+        Column(
+            modifier = Modifier.weight(0.55f).fillMaxHeight(),
+            verticalArrangement = Arrangement.Center,
+        ) {
+            TrendGraphCard(samples = recentSamples, currentZone = zone, zoneSettings = zoneSettings)
+
+            Spacer(Modifier.height(20.dp))
+
+            SessionActionButton(active = sessionActive, onClick = if (sessionActive) onEndSession else onStartSession)
+        }
+    }
+}
+
+@Composable
+private fun HeartRateInfoRow(elapsedText: String?, zone: Double?) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        elapsedText?.let {
+            InfoPill {
+                ClockGlyph(tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
+                Spacer(Modifier.width(7.dp))
+                Text(it, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
+            }
+            Spacer(Modifier.width(10.dp))
+            Text("·", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f))
+            Spacer(Modifier.width(10.dp))
+        }
+        InfoPill {
+            Text(
+                text = zone?.let { "Zone %.1f · Fitbit Air".format(it) } ?: "Fitbit Air",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
+            )
         }
     }
 }
@@ -1291,76 +1418,79 @@ private fun AppDrawerContent(
         drawerContainerColor = MaterialTheme.colorScheme.surface,
         modifier = Modifier.width(320.dp),
     ) {
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .padding(horizontal = 22.dp, vertical = 16.dp),
         ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Box(
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) { HeartGlyph(tint = MaterialTheme.colorScheme.primary) }
+                    SquareIconButton(onClick = onClose) { CloseGlyph(tint = MaterialTheme.colorScheme.onSurface) }
+                }
+
+                Spacer(Modifier.height(18.dp))
+                Text("Your Profile", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(14.dp))
+
+                Column(
                     modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                        .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
-                    contentAlignment = Alignment.Center,
-                ) { HeartGlyph(tint = MaterialTheme.colorScheme.primary) }
-                SquareIconButton(onClick = onClose) { CloseGlyph(tint = MaterialTheme.colorScheme.onSurface) }
-            }
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
+                        .padding(horizontal = 16.dp),
+                ) {
+                    ProfileRow(label = "AGE", value = zoneSettings.age.toString(), onEdit = onEditProfile)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                    ProfileRow(label = "RESTING HR", value = "${zoneSettings.restingHr} bpm", onEdit = onEditProfile)
+                }
 
-            Spacer(Modifier.height(18.dp))
-            Text("Your Profile", fontSize = 19.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(14.dp))
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
-                    .padding(horizontal = 16.dp),
-            ) {
-                ProfileRow(label = "AGE", value = zoneSettings.age.toString(), onEdit = onEditProfile)
+                Spacer(Modifier.height(20.dp))
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-                ProfileRow(label = "RESTING HR", value = "${zoneSettings.restingHr} bpm", onEdit = onEditProfile)
-            }
+                Spacer(Modifier.height(16.dp))
 
-            Spacer(Modifier.height(20.dp))
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-            Spacer(Modifier.height(16.dp))
+                Text("Appearance", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                ThemeModeSelector(selected = themeMode, onSelect = onThemeModeChange)
 
-            Text("Appearance", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(10.dp))
-            ThemeModeSelector(selected = themeMode, onSelect = onThemeModeChange)
+                Spacer(Modifier.height(20.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                Spacer(Modifier.height(16.dp))
 
-            Spacer(Modifier.height(20.dp))
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-            Spacer(Modifier.height(16.dp))
-
-            Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            Text(
-                text = if (summaries.isEmpty()) "No sessions yet" else "${summaries.size} sessions logged",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
-            )
-            Spacer(Modifier.height(10.dp))
-
-            if (summaries.isEmpty()) {
+                Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    "Sessions you save will show up here as a table.",
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                    modifier = Modifier.padding(vertical = 12.dp),
+                    text = if (summaries.isEmpty()) "No sessions yet" else "${summaries.size} sessions logged",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
                 )
-            } else {
-                SessionTableHeader()
-                LazyColumn(modifier = Modifier.weight(1f)) {
-                    items(summaries, key = { it.session.id }) { summary ->
-                        SessionTableRow(summary = summary, zoneSettings = zoneSettings, onClick = { onSessionClick(summary.session) })
-                    }
+                Spacer(Modifier.height(10.dp))
+
+                if (summaries.isEmpty()) {
+                    Text(
+                        "Sessions you save will show up here as a table.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                } else {
+                    SessionTableHeader()
                 }
             }
+
+            items(summaries, key = { it.session.id }) { summary ->
+                SessionTableRow(summary = summary, zoneSettings = zoneSettings, onClick = { onSessionClick(summary.session) })
+            }
+
+            item { Spacer(Modifier.height(8.dp)) }
         }
     }
 }
@@ -1515,6 +1645,7 @@ private fun SessionDetailScreen(
         }
 
         val currentSamples = samples
+        val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
         when {
             currentSamples == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Loading…", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
@@ -1523,53 +1654,17 @@ private fun SessionDetailScreen(
                 Text("No samples recorded for this session.", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
             }
             else -> {
-                Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        StatTile("AVG", stats?.avgBpm?.roundToInt()?.toString() ?: "--", Modifier.weight(1f))
-                        StatTile("MAX", stats?.maxBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(3))
-                        StatTile("MIN", stats?.minBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(0))
-                        StatTile("DURATION", formatDuration(session.endedAtMs - session.startedAtMs), Modifier.weight(1f))
+                Crossfade(
+                    targetState = isLandscape,
+                    modifier = Modifier.weight(1f),
+                    animationSpec = tween(300),
+                    label = "sessionDetailBodyOrientation",
+                ) { landscape ->
+                    if (landscape) {
+                        SessionDetailLandscapeBody(currentSamples, stats, session, zoneSettings)
+                    } else {
+                        SessionDetailPortraitBody(currentSamples, stats, session, zoneSettings)
                     }
-
-                    Spacer(Modifier.height(16.dp))
-
-                    val zoneBoundaries = remember(zoneSettings) {
-                        HeartRateZones.zoneBandBoundariesBpm(zoneSettings.age, zoneSettings.restingHr)
-                    }
-                    Column(
-                        modifier = Modifier
-                            .padding(horizontal = 20.dp)
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(24.dp))
-                            .background(MaterialTheme.colorScheme.surface)
-                            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(24.dp))
-                            .padding(18.dp),
-                    ) {
-                        Text("HEART RATE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
-                        Spacer(Modifier.height(10.dp))
-                        InteractiveBpmChart(
-                            samples = currentSamples.map { HeartRateSample(it.bpm, it.timestampMs) },
-                            lineColor = MaterialTheme.colorScheme.primary,
-                            zoneSettings = zoneSettings,
-                            highlightLatest = false,
-                            zoneBoundariesBpm = zoneBoundaries,
-                            modifier = Modifier.fillMaxWidth().height(190.dp),
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(timeLabel(session.startedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
-                            Text(timeLabel(session.endedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
-                        }
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-
-                    val breakdown = remember(currentSamples, zoneSettings) { zoneBreakdownMs(currentSamples, zoneSettings) }
-                    ZoneBreakdownCard(breakdown, modifier = Modifier.padding(horizontal = 20.dp))
-                    Spacer(Modifier.height(20.dp))
                 }
 
                 Row(
@@ -1621,6 +1716,85 @@ private fun SessionDetailScreen(
             },
             dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable
+private fun SessionDetailStatsRow(stats: SessionStats?, session: SessionEntity, modifier: Modifier = Modifier) {
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatTile("AVG", stats?.avgBpm?.roundToInt()?.toString() ?: "--", Modifier.weight(1f))
+        StatTile("MAX", stats?.maxBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(3))
+        StatTile("MIN", stats?.minBpm?.toString() ?: "--", Modifier.weight(1f), color = zoneChipTextColor(0))
+        StatTile("DURATION", formatDuration(session.endedAtMs - session.startedAtMs), Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun SessionDetailChartCard(currentSamples: List<SampleEntity>, session: SessionEntity, zoneSettings: ZoneSettings, modifier: Modifier = Modifier) {
+    val zoneBoundaries = remember(zoneSettings) {
+        HeartRateZones.zoneBandBoundariesBpm(zoneSettings.age, zoneSettings.restingHr)
+    }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(24.dp))
+            .padding(18.dp),
+    ) {
+        Text("HEART RATE", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+        Spacer(Modifier.height(10.dp))
+        InteractiveBpmChart(
+            samples = currentSamples.map { HeartRateSample(it.bpm, it.timestampMs) },
+            lineColor = MaterialTheme.colorScheme.primary,
+            zoneSettings = zoneSettings,
+            highlightLatest = false,
+            zoneBoundariesBpm = zoneBoundaries,
+            modifier = Modifier.fillMaxWidth().height(190.dp),
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(timeLabel(session.startedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+            Text(timeLabel(session.endedAtMs), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+        }
+    }
+}
+
+@Composable
+private fun SessionDetailPortraitBody(currentSamples: List<SampleEntity>, stats: SessionStats?, session: SessionEntity, zoneSettings: ZoneSettings) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        SessionDetailStatsRow(stats, session, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp))
+
+        Spacer(Modifier.height(16.dp))
+
+        SessionDetailChartCard(currentSamples, session, zoneSettings, modifier = Modifier.padding(horizontal = 20.dp))
+
+        Spacer(Modifier.height(14.dp))
+
+        val breakdown = remember(currentSamples, zoneSettings) { zoneBreakdownMs(currentSamples, zoneSettings) }
+        ZoneBreakdownCard(breakdown, modifier = Modifier.padding(horizontal = 20.dp))
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+@Composable
+private fun SessionDetailLandscapeBody(currentSamples: List<SampleEntity>, stats: SessionStats?, session: SessionEntity, zoneSettings: ZoneSettings) {
+    Row(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+        Column(Modifier.weight(0.5f).fillMaxHeight(), verticalArrangement = Arrangement.Center) {
+            SessionDetailChartCard(currentSamples, session, zoneSettings)
+        }
+
+        Spacer(Modifier.width(20.dp))
+
+        Column(Modifier.weight(0.5f).fillMaxHeight().verticalScroll(rememberScrollState())) {
+            SessionDetailStatsRow(stats, session, modifier = Modifier.fillMaxWidth())
+
+            Spacer(Modifier.height(16.dp))
+
+            val breakdown = remember(currentSamples, zoneSettings) { zoneBreakdownMs(currentSamples, zoneSettings) }
+            ZoneBreakdownCard(breakdown)
+            Spacer(Modifier.height(20.dp))
+        }
     }
 }
 
