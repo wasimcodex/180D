@@ -58,8 +58,8 @@ enum class ConnectionState {
 }
 
 /**
- * Foreground service owning the BLE connection to the Fitbit Air's standard
- * Heart Rate service (0x180D). See CLAUDE.md for the hardware facts and
+ * Foreground service owning the BLE connection to a device's standard Heart
+ * Rate service (0x180D). See CLAUDE.md for the hardware facts and
  * GATT-cache gotcha this implementation works around.
  */
 class BleHeartRateService : Service() {
@@ -154,11 +154,12 @@ class BleHeartRateService : Service() {
         serviceScope.launch { sessionRepository.startSession(startMs) }
         serviceScope.launch {
             _connectionState.value = ConnectionState.SCANNING
-            val device = findAirDevice()
+            val device = findHeartRateDevice()
             if (device == null) {
                 _connectionState.value = ConnectionState.LINK_LOST_UNRECOVERABLE
-                _lastError.value = "Couldn't find Google Fitbit Air. In Google Health, go to " +
-                    "Connections → Fitbit Air and enable “Always visible,” then start a new session."
+                _lastError.value = "Couldn't find a heart rate tracker. Make sure it's powered " +
+                    "on, nearby, and broadcasting (put it in pairing/discoverable mode if it " +
+                    "has one), then start a new session."
                 return@launch
             }
             targetDevice = device
@@ -185,17 +186,26 @@ class BleHeartRateService : Service() {
     }
 
     // ---- Device discovery ---------------------------------------------------
+    // Matches any BLE peripheral serving the standard Heart Rate service
+    // (0x180D), not just the Fitbit Air — see "Device discovery" in CLAUDE.md.
 
     @SuppressLint("MissingPermission")
-    private suspend fun findAirDevice(): BluetoothDevice? {
+    private suspend fun findHeartRateDevice(): BluetoothDevice? {
         if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) return null
-        bluetoothAdapter.bondedDevices?.firstOrNull { it.name == AIR_DEVICE_NAME }?.let { return it }
+        // Fast path: a bonded device whose OS-cached UUID list already advertises 0x180D.
+        // This is a soft hint only, not a guarantee — like the GATT service cache described
+        // under "GATT cache" in CLAUDE.md, this list can be stale or absent for a device that
+        // supports the service but hasn't had it cached yet. The scan below is authoritative;
+        // this only lets an already-known device skip the scan wait.
+        bluetoothAdapter.bondedDevices
+            ?.firstOrNull { device -> device.uuids?.any { it.uuid == HR_SERVICE_UUID } == true }
+            ?.let { return it }
         if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) return null
-        return scanForAir()
+        return scanForHeartRateDevice()
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun scanForAir(): BluetoothDevice? = withTimeoutOrNull(SCAN_TIMEOUT_MS) {
+    private suspend fun scanForHeartRateDevice(): BluetoothDevice? = withTimeoutOrNull(SCAN_TIMEOUT_MS) {
         suspendCancellableCoroutine { cont ->
             val scanner = bluetoothAdapter.bluetoothLeScanner
             if (scanner == null) {
@@ -241,8 +251,8 @@ class BleHeartRateService : Service() {
         if (firstDisconnectAtMs == 0L) firstDisconnectAtMs = now
         if (now - firstDisconnectAtMs >= UNRECOVERABLE_AFTER_MS) {
             _connectionState.value = ConnectionState.LINK_LOST_UNRECOVERABLE
-            _lastError.value = "Lost connection to Fitbit Air. Re-enable “Always visible” " +
-                "in Google Health, then start a new session."
+            _lastError.value = "Lost connection to your heart rate tracker. Make sure it's " +
+                "nearby and broadcasting, then start a new session."
             return
         }
 
@@ -396,7 +406,7 @@ class BleHeartRateService : Service() {
     private fun buildCompatNotification(sample: HeartRateSample?): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Fitbit Air heart rate")
+            .setContentTitle("Heart rate")
             .setContentText(notificationContentText(sample))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -461,7 +471,7 @@ class BleHeartRateService : Service() {
 
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Fitbit Air heart rate")
+            .setContentTitle("Heart rate")
             .setContentText(notificationContentText(sample))
             .setStyle(style)
             .setOngoing(true)
@@ -485,7 +495,6 @@ class BleHeartRateService : Service() {
         const val ACTION_START = "com.example.a180d.action.START_SESSION"
         const val ACTION_STOP = "com.example.a180d.action.STOP_SESSION"
 
-        private const val AIR_DEVICE_NAME = "Google Fitbit Air"
         private const val LEGACY_LOW_IMPORTANCE_CHANNEL_ID = "heart_rate_session"
         private const val CHANNEL_ID = "heart_rate_session_v2"
         private const val NOTIFICATION_ID = 1001

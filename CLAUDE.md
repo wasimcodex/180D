@@ -273,10 +273,26 @@ the link drops and cannot be re-established.
 
 ## Device discovery
 
-Do not hardcode the MAC. Resolve in this order:
+Do not hardcode a MAC or a device name — the app supports any BLE peripheral
+that serves the standard Heart Rate service (0x180D), not just the Fitbit
+Air. This is deliberate: the app is distributed publicly (see
+"Distribution" below) to people who may own a different HR-capable
+tracker. Resolve in this order:
 
-1. `BluetoothAdapter.getBondedDevices()`, match on name `Google Fitbit Air`
-2. Fall back to a `ScanFilter` on service UUID `0x180D`
+1. `BluetoothAdapter.getBondedDevices()`, fast-path match on a bonded device
+   whose OS-cached UUID list (`BluetoothDevice.getUuids()`) already includes
+   `0x180D`. This is a soft optimization, not a guarantee — like the GATT
+   service cache described below, this list can be stale or empty for a
+   device that supports the service but hasn't had it cached yet.
+2. Fall back to a `ScanFilter` on service UUID `0x180D`. This is the
+   authoritative, device-agnostic path and works for any HR peripheral
+   regardless of bond state or name.
+
+The Fitbit Air specifically requires Google Health's "Always visible" toggle
+to be on before it will advertise (see "Connection constraints" below) —
+that's an Air-specific quirk the app can't detect generically, so user-facing
+error copy stays generic ("make sure it's broadcasting") rather than naming
+Google Health.
 
 ---
 
@@ -449,6 +465,8 @@ Do not add these unless explicitly asked:
 - Health Connect read or write
 - Training recommendations, readiness scores, or coaching output
 - Any Google/Fitbit account authentication
+- Play Store distribution, Developer Declaration Form, or any Play Console
+  metadata (GitHub Releases only — see "Distribution" below)
 
 ---
 
@@ -548,14 +566,31 @@ native Kotlin anyway, plus a bridge. Native-only is strictly less work here.
 
 ### Distribution
 
-Debug APK, sideloaded, single user. There is **no** Play Store release, so:
+Distributed as a signed release APK via GitHub Releases — not the Play
+Store. A tagged push (`vX.Y.Z`) triggers `.github/workflows/release.yml`,
+which builds `assembleRelease` signed with a dedicated release keystore
+(never committed — see `keystore.properties.example` and the
+`signingConfigs` block in `app/build.gradle.kts`) and attaches the resulting
+APK to the GitHub Release. Local `assembleRelease` without a keystore
+present still succeeds — it just produces an unsigned
+`app-release-unsigned.apk` instead of a signed `app-release.apk` — so
+contributors without access to the release-signing secrets are never
+blocked.
+`.github/workflows/ci.yml` runs `test`/`lint`/`assembleDebug` on every push
+and PR to `main`.
+
+Because there's still no Play Store release:
 
 - no Developer Declaration Form
 - no health-permissions review
 - no privacy policy hosting requirement
-- no signing config beyond the debug keystore
 
-Do not add release signing, Play Console metadata, crash reporting, or analytics.
+Real release signing, a public MIT `LICENSE`, and this CI/release pipeline
+are now intentional, permanent parts of the project — do not reintroduce "no
+signing config" as an assumption elsewhere in this file. Crash reporting and
+analytics remain out of scope regardless of distribution channel — this app
+is local-only and handles health data (see "Session logging" and "Out of
+scope").
 
 ---
 

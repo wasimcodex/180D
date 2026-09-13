@@ -1,8 +1,35 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
+
+// Release signing: read from a local, gitignored keystore.properties (see
+// keystore.properties.example) or from environment variables (set by CI from
+// repository secrets). Neither is required for local debug/dev work — with
+// neither present, `assembleRelease` still succeeds, producing an unsigned
+// app-release-unsigned.apk rather than failing, so contributors without
+// release-signing access are never blocked. See "Distribution" in CLAUDE.md.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        FileInputStream(keystorePropertiesFile).use { load(it) }
+    }
+}
+
+fun signingProp(propKey: String, envKey: String): String? =
+    keystoreProperties.getProperty(propKey) ?: System.getenv(envKey)
+
+val releaseStoreFile = signingProp("storeFile", "RELEASE_STORE_FILE")
+val releaseStorePassword = signingProp("storePassword", "RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = signingProp("keyAlias", "RELEASE_KEY_ALIAS")
+val releaseKeyPassword = signingProp("keyPassword", "RELEASE_KEY_PASSWORD")
+val hasReleaseSigningConfig = listOf(
+    releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword,
+).all { !it.isNullOrBlank() }
 
 android {
     namespace = "com.example.a180d"
@@ -20,10 +47,24 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    if (hasReleaseSigningConfig) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             optimization {
                 enable = false
+            }
+            if (hasReleaseSigningConfig) {
+                signingConfig = signingConfigs.getByName("release")
             }
         }
     }

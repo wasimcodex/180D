@@ -580,7 +580,7 @@ private fun HeartRateInfoRow(elapsedText: String?, zone: Double?) {
         }
         InfoPill {
             Text(
-                text = zone?.let { "Zone %.1f · Fitbit Air".format(it) } ?: "Fitbit Air",
+                text = zone?.let { "Zone %.1f".format(it) } ?: "Heart Rate",
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
@@ -613,7 +613,7 @@ private fun ConnectionStatusPill(connectionState: ConnectionState) {
 
 private fun ConnectionState.toDisplayLabel(): String = when (this) {
     ConnectionState.DISCONNECTED -> "Not connected"
-    ConnectionState.SCANNING -> "Looking for Fitbit Air…"
+    ConnectionState.SCANNING -> "Looking for heart rate tracker…"
     ConnectionState.CONNECTING, ConnectionState.DISCOVERING -> "Connecting…"
     ConnectionState.CONNECTED -> "Connected"
     ConnectionState.RECONNECTING -> "Reconnecting…"
