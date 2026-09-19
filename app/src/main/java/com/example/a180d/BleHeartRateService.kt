@@ -30,6 +30,7 @@ import android.os.ParcelUuid
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,6 +51,7 @@ data class HeartRateSample(val bpm: Int, val timestampMs: Long)
 enum class ConnectionState {
     DISCONNECTED,
     SCANNING,
+    AWAITING_DEVICE_SELECTION,
     CONNECTING,
     DISCOVERING,
     CONNECTED,
@@ -90,6 +92,10 @@ class BleHeartRateService : Service() {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
+    private val _discoveredDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
+    /** Non-empty only while [ConnectionState.AWAITING_DEVICE_SELECTION] is showing a picker. */
+    val discoveredDevices: StateFlow<List<BluetoothDevice>> = _discoveredDevices.asStateFlow()
+
     private val _sessionStartMs = MutableStateFlow(0L)
     val sessionStartMs: StateFlow<Long> = _sessionStartMs.asStateFlow()
 
@@ -99,6 +105,10 @@ class BleHeartRateService : Service() {
     private var reconnectJob: Job? = null
     private var firstDisconnectAtMs = 0L
     private var backoffIndex = 0
+    private var pendingStopGatt: BluetoothGatt? = null
+    private var pendingStopCloseJob: Job? = null
+    private var deviceSelectionDeferred: CompletableDeferred<BluetoothDevice?>? = null
+    private var probingDeferred: CompletableDeferred<Boolean>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -152,19 +162,7 @@ class BleHeartRateService : Service() {
         firstDisconnectAtMs = 0L
         backoffIndex = 0
         serviceScope.launch { sessionRepository.startSession(startMs) }
-        serviceScope.launch {
-            _connectionState.value = ConnectionState.SCANNING
-            val device = findHeartRateDevice()
-            if (device == null) {
-                _connectionState.value = ConnectionState.LINK_LOST_UNRECOVERABLE
-                _lastError.value = "Couldn't find a heart rate tracker. Make sure it's powered " +
-                    "on, nearby, and broadcasting (put it in pairing/discoverable mode if it " +
-                    "has one), then start a new session."
-                return@launch
-            }
-            targetDevice = device
-            attemptConnect()
-        }
+        serviceScope.launch { connectToHeartRateDevice() }
     }
 
     @SuppressLint("MissingPermission")
@@ -173,15 +171,27 @@ class BleHeartRateService : Service() {
         _sessionStartMs.value = 0L
         reconnectJob?.cancel()
         reconnectJob = null
-        currentGatt?.let { gatt ->
-            runCatching { gatt.disconnect() }
-            runCatching { gatt.close() }
-        }
+        val gattToClose = currentGatt
         currentGatt = null
         targetDevice = null
         _connectionState.value = ConnectionState.DISCONNECTED
         _latestSample.value = null
         _recentSamples.value = emptyList()
+        if (gattToClose != null) {
+            pendingStopCloseJob?.cancel()
+            pendingStopGatt = gattToClose
+            runCatching { gattToClose.disconnect() }
+            // handleDisconnected() closes it once STATE_DISCONNECTED is confirmed, which is
+            // the non-racy path — closing before the stack confirms teardown can leave the
+            // underlying link up and break the next connectGatt(). This is a bounded safety
+            // net only for the rare case that callback never arrives, since never closing at
+            // all leaks the GATT client registration and eventually blocks all connections.
+            pendingStopCloseJob = serviceScope.launch {
+                delay(DISCONNECT_CLOSE_TIMEOUT_MS)
+                runCatching { gattToClose.close() }
+                pendingStopGatt = null
+            }
+        }
         serviceScope.launch { sessionRepository.endSession() }
     }
 
@@ -189,27 +199,134 @@ class BleHeartRateService : Service() {
     // Matches any BLE peripheral serving the standard Heart Rate service
     // (0x180D), not just the Fitbit Air — see "Device discovery" in CLAUDE.md.
 
+    /**
+     * Tries a device we already know serves HR before ever scanning. Bonded devices don't
+     * need to be rediscovered via a BLE advertisement to connect — connectGatt() attaches to
+     * an existing link directly — and a peripheral that's already link-layer connected to
+     * another app (e.g. Google Health's own persistent connection once bonded) has no reason
+     * to keep broadcasting even though it's still reachable, so scanning first can miss it
+     * entirely (confirmed on hardware — see "Device discovery" in CLAUDE.md). Scanning is
+     * only used as the fallback, for a first-ever/new/different device.
+     */
     @SuppressLint("MissingPermission")
-    private suspend fun findHeartRateDevice(): BluetoothDevice? {
-        if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) return null
-        // Fast path: a bonded device whose OS-cached UUID list already advertises 0x180D.
-        // This is a soft hint only, not a guarantee — like the GATT service cache described
-        // under "GATT cache" in CLAUDE.md, this list can be stale or absent for a device that
-        // supports the service but hasn't had it cached yet. The scan below is authoritative;
-        // this only lets an already-known device skip the scan wait.
-        bluetoothAdapter.bondedDevices
-            ?.firstOrNull { device -> device.uuids?.any { it.uuid == HR_SERVICE_UUID } == true }
-            ?.let { return it }
-        if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) return null
-        return scanForHeartRateDevice()
+    private suspend fun connectToHeartRateDevice() {
+        if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+            reportDeviceNotFound()
+            return
+        }
+        val knownDevice = knownDeviceCandidate()
+        if (knownDevice != null && tryDirectConnect(knownDevice)) return
+
+        if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
+            reportDeviceNotFound()
+            return
+        }
+        _connectionState.value = ConnectionState.SCANNING
+        val scanned = scanForHeartRateDevices()
+        val device = if (scanned.isNotEmpty()) resolveDevice(scanned) else null
+        if (device == null) {
+            reportDeviceNotFound()
+            return
+        }
+        targetDevice = device
+        attemptConnect()
+    }
+
+    private fun reportDeviceNotFound() {
+        _connectionState.value = ConnectionState.LINK_LOST_UNRECOVERABLE
+        _lastError.value = "Couldn't find a heart rate tracker. Make sure it's powered " +
+            "on, nearby, and broadcasting (put it in pairing/discoverable mode if it " +
+            "has one), then start a new session."
+    }
+
+    /**
+     * The remembered device (from a prior successful connection) if we have one — the
+     * strongest signal, tried directly with no discovery step at all. Otherwise, a bonded
+     * device whose OS-cached UUID list already advertises 0x180D (a soft hint only, per the
+     * "GATT cache" gotcha in CLAUDE.md — this list can be stale or absent even for a device
+     * that does serve HR).
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun knownDeviceCandidate(): BluetoothDevice? {
+        val remembered = userSettings.loadRememberedDeviceAddress()
+        if (remembered != null) {
+            return runCatching { bluetoothAdapter.getRemoteDevice(remembered) }.getOrNull()
+        }
+        val bondedMatches = bluetoothAdapter.bondedDevices
+            ?.filter { device -> device.uuids?.any { it.uuid == HR_SERVICE_UUID } == true }
+            .orEmpty()
+        return if (bondedMatches.isEmpty()) null else resolveDevice(bondedMatches)
+    }
+
+    /**
+     * Attempts to connect to [device] with a bounded timeout, since it wasn't confirmed
+     * reachable via scan. Returns true if it connected (the normal gattCallback flow takes
+     * over from there); false if it timed out or was rejected, after cleanly aborting the
+     * attempt so it doesn't linger or conflict with the scan fallback that follows.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun tryDirectConnect(device: BluetoothDevice): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        probingDeferred = deferred
+        targetDevice = device
+        attemptConnect()
+        val connected = withTimeoutOrNull(DIRECT_CONNECT_TIMEOUT_MS) { deferred.await() } ?: false
+        probingDeferred = null
+        if (!connected) {
+            val gattToAbort = currentGatt
+            currentGatt = null
+            targetDevice = null
+            if (gattToAbort != null) {
+                runCatching { gattToAbort.disconnect() }
+                serviceScope.launch {
+                    delay(DISCONNECT_CLOSE_TIMEOUT_MS)
+                    runCatching { gattToAbort.close() }
+                }
+            }
+        }
+        return connected
+    }
+
+    /**
+     * Picks one device out of several HR-capable candidates: the previously-remembered
+     * device wins silently if present, a lone candidate is auto-picked, and anything else
+     * suspends until the Activity calls [selectDevice] or [cancelDeviceSelection].
+     */
+    private suspend fun resolveDevice(candidates: List<BluetoothDevice>): BluetoothDevice? {
+        val remembered = userSettings.loadRememberedDeviceAddress()
+        candidates.firstOrNull { it.address == remembered }?.let { return it }
+        if (candidates.size == 1) {
+            val device = candidates.single()
+            userSettings.saveRememberedDeviceAddress(device.address)
+            return device
+        }
+        _discoveredDevices.value = candidates
+        _connectionState.value = ConnectionState.AWAITING_DEVICE_SELECTION
+        val deferred = CompletableDeferred<BluetoothDevice?>()
+        deviceSelectionDeferred = deferred
+        val chosen = deferred.await()
+        _discoveredDevices.value = emptyList()
+        deviceSelectionDeferred = null
+        chosen?.let { userSettings.saveRememberedDeviceAddress(it.address) }
+        return chosen
+    }
+
+    /** Called by the bound Activity when the user taps a device in the picker. */
+    fun selectDevice(device: BluetoothDevice) {
+        deviceSelectionDeferred?.complete(device)
+    }
+
+    /** Called by the bound Activity when the user dismisses the picker without choosing. */
+    fun cancelDeviceSelection() {
+        deviceSelectionDeferred?.complete(null)
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun scanForHeartRateDevice(): BluetoothDevice? = withTimeoutOrNull(SCAN_TIMEOUT_MS) {
+    private suspend fun scanForHeartRateDevices(): List<BluetoothDevice> = withTimeoutOrNull(SCAN_TIMEOUT_MS) {
         suspendCancellableCoroutine { cont ->
             val scanner = bluetoothAdapter.bluetoothLeScanner
             if (scanner == null) {
-                cont.resume(null)
+                cont.resume(emptyList())
                 return@suspendCancellableCoroutine
             }
             val filter = ScanFilter.Builder()
@@ -218,19 +335,44 @@ class BleHeartRateService : Service() {
             val settings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
-            val callback = object : ScanCallback() {
+            val rememberedAddress = userSettings.loadRememberedDeviceAddress()
+            val found = LinkedHashMap<String, BluetoothDevice>()
+            var graceJob: Job? = null
+            lateinit var callback: ScanCallback
+
+            fun finish() {
+                runCatching { scanner.stopScan(callback) }
+                graceJob?.cancel()
+                if (cont.isActive) cont.resume(found.values.toList())
+            }
+
+            callback = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    runCatching { scanner.stopScan(this) }
-                    if (cont.isActive) cont.resume(result.device)
+                    val device = result.device
+                    if (found.putIfAbsent(device.address, device) != null) return
+                    if (device.address == rememberedAddress) {
+                        // Known device seen — resolve immediately, same latency as before.
+                        finish()
+                    } else if (graceJob == null) {
+                        // Give other nearby HR devices a short window to show up too, rather
+                        // than always waiting out the full scan timeout for a lone device.
+                        graceJob = serviceScope.launch {
+                            delay(DEVICE_COLLECTION_GRACE_MS)
+                            finish()
+                        }
+                    }
                 }
                 override fun onScanFailed(errorCode: Int) {
-                    if (cont.isActive) cont.resume(null)
+                    if (cont.isActive) cont.resume(found.values.toList())
                 }
             }
-            cont.invokeOnCancellation { runCatching { scanner.stopScan(callback) } }
+            cont.invokeOnCancellation {
+                graceJob?.cancel()
+                runCatching { scanner.stopScan(callback) }
+            }
             scanner.startScan(listOf(filter), settings, callback)
         }
-    }
+    } ?: emptyList()
 
     // ---- Connection + reconnection ------------------------------------------
 
@@ -243,8 +385,21 @@ class BleHeartRateService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun handleDisconnected(gatt: BluetoothGatt) {
+        if (pendingStopGatt === gatt) {
+            pendingStopCloseJob?.cancel()
+            pendingStopCloseJob = null
+            pendingStopGatt = null
+        }
         runCatching { gatt.close() }
         if (currentGatt === gatt) currentGatt = null
+        probingDeferred?.let { deferred ->
+            if (deferred.isActive) {
+                // tryDirectConnect() owns cleanup/fallback for a probe attempt — don't also
+                // kick off the normal backoff/reconnect loop for it.
+                deferred.complete(false)
+                return
+            }
+        }
         if (!sessionActive) return
 
         val now = System.currentTimeMillis()
@@ -274,6 +429,7 @@ class BleHeartRateService : Service() {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     _connectionState.value = ConnectionState.DISCOVERING
+                    probingDeferred?.complete(true)
                     gatt.forceRefresh()
                     gatt.discoverServices()
                 }
@@ -390,6 +546,7 @@ class BleHeartRateService : Service() {
     private fun notificationContentText(sample: HeartRateSample?): String = when {
         sample != null -> "${sample.bpm} bpm"
         connectionState.value == ConnectionState.RECONNECTING -> "Reconnecting…"
+        connectionState.value == ConnectionState.AWAITING_DEVICE_SELECTION -> "Choose a device…"
         connectionState.value == ConnectionState.SCANNING ||
             connectionState.value == ConnectionState.CONNECTING ||
             connectionState.value == ConnectionState.DISCOVERING -> "Connecting…"
@@ -499,6 +656,9 @@ class BleHeartRateService : Service() {
         private const val CHANNEL_ID = "heart_rate_session_v2"
         private const val NOTIFICATION_ID = 1001
         private const val SCAN_TIMEOUT_MS = 8_000L
+        private const val DEVICE_COLLECTION_GRACE_MS = 2_000L
+        private const val DIRECT_CONNECT_TIMEOUT_MS = 5_000L
+        private const val DISCONNECT_CLOSE_TIMEOUT_MS = 2_000L
         private const val UNRECOVERABLE_AFTER_MS = 30_000L
         private const val TREND_WINDOW_MS = 5 * 60_000L
         private val BACKOFF_SCHEDULE_MS = longArrayOf(1_000, 2_000, 4_000, 8_000, 30_000)

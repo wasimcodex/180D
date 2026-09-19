@@ -1,7 +1,9 @@
 package com.example.a180d
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
+import android.bluetooth.BluetoothDevice
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -229,6 +231,7 @@ private val EMPTY_RECENT_SAMPLES_FLOW = MutableStateFlow<List<HeartRateSample>>(
 private val EMPTY_ERROR_FLOW = MutableStateFlow<String?>(null)
 private val EMPTY_SESSION_START_FLOW = MutableStateFlow(0L)
 private val EMPTY_PENDING_SESSION_FLOW = MutableStateFlow<SessionEntity?>(null)
+private val EMPTY_DEVICE_LIST_FLOW = MutableStateFlow<List<BluetoothDevice>>(emptyList())
 
 private const val STALE_AFTER_MS = 5_000L
 
@@ -366,6 +369,7 @@ private fun HeartRateScreen(
     val recentSamples by (service?.recentSamples ?: EMPTY_RECENT_SAMPLES_FLOW).collectAsStateWithLifecycle()
     val error by (service?.lastError ?: EMPTY_ERROR_FLOW).collectAsStateWithLifecycle()
     val sessionStartMs by (service?.sessionStartMs ?: EMPTY_SESSION_START_FLOW).collectAsStateWithLifecycle()
+    val discoveredDevices by (service?.discoveredDevices ?: EMPTY_DEVICE_LIST_FLOW).collectAsStateWithLifecycle()
 
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
@@ -448,6 +452,14 @@ private fun HeartRateScreen(
                 )
             }
         }
+    }
+
+    if (connectionState == ConnectionState.AWAITING_DEVICE_SELECTION && discoveredDevices.isNotEmpty()) {
+        DevicePickerDialog(
+            devices = discoveredDevices,
+            onSelect = { service?.selectDevice(it) },
+            onCancel = { service?.cancelDeviceSelection() },
+        )
     }
 }
 
@@ -614,6 +626,7 @@ private fun ConnectionStatusPill(connectionState: ConnectionState) {
 private fun ConnectionState.toDisplayLabel(): String = when (this) {
     ConnectionState.DISCONNECTED -> "Not connected"
     ConnectionState.SCANNING -> "Looking for heart rate tracker…"
+    ConnectionState.AWAITING_DEVICE_SELECTION -> "Choose a device…"
     ConnectionState.CONNECTING, ConnectionState.DISCOVERING -> "Connecting…"
     ConnectionState.CONNECTED -> "Connected"
     ConnectionState.RECONNECTING -> "Reconnecting…"
@@ -623,6 +636,7 @@ private fun ConnectionState.toDisplayLabel(): String = when (this) {
 private fun ConnectionState.indicatorColor(): Color = when (this) {
     ConnectionState.DISCONNECTED -> Color(0xFF9E9E9E)
     ConnectionState.SCANNING,
+    ConnectionState.AWAITING_DEVICE_SELECTION,
     ConnectionState.CONNECTING,
     ConnectionState.DISCOVERING,
     ConnectionState.RECONNECTING,
@@ -632,6 +646,7 @@ private fun ConnectionState.indicatorColor(): Color = when (this) {
 }
 
 private fun ConnectionState.isInProgress(): Boolean = this == ConnectionState.SCANNING ||
+    this == ConnectionState.AWAITING_DEVICE_SELECTION ||
     this == ConnectionState.CONNECTING ||
     this == ConnectionState.DISCOVERING ||
     this == ConnectionState.RECONNECTING
@@ -1569,6 +1584,35 @@ private fun SessionTableRow(summary: SessionSummary, zoneSettings: ZoneSettings,
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
     }
+}
+
+@SuppressLint("MissingPermission")
+@Composable
+private fun DevicePickerDialog(devices: List<BluetoothDevice>, onSelect: (BluetoothDevice) -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Choose a heart rate device") },
+        text = {
+            Column {
+                Text(
+                    "More than one nearby device is broadcasting heart rate data. Pick one — " +
+                        "future sessions will reconnect to it automatically.",
+                )
+                Spacer(Modifier.height(12.dp))
+                devices.forEach { device ->
+                    Text(
+                        text = device.name ?: device.address,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(device) }
+                            .padding(vertical = 12.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
 }
 
 @Composable

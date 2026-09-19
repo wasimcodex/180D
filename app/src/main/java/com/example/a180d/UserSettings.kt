@@ -36,11 +36,19 @@ class UserSettings(context: Context) {
         prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, enabled).apply()
     }
 
+    /** The address of the device the user last picked, so repeat sessions can skip the picker. */
+    fun loadRememberedDeviceAddress(): String? = prefs.getString(KEY_REMEMBERED_DEVICE_ADDRESS, null)
+
+    fun saveRememberedDeviceAddress(address: String?) {
+        prefs.edit().putString(KEY_REMEMBERED_DEVICE_ADDRESS, address).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "user_settings"
         private const val KEY_AGE = "age"
         private const val KEY_RESTING_HR = "resting_hr"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val KEY_REMEMBERED_DEVICE_ADDRESS = "remembered_device_address"
     }
 }

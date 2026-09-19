@@ -20,6 +20,31 @@ is needed for Compose. Implemented so far:
   reflection call before discovery, Service Changed (0x1801/0x2A05)
   resubscription, HR measurement flags-byte parsing, event-driven reconnect
   with the documented backoff schedule and 30s unrecoverable cutoff.
+  `stopSession()` requests `disconnect()` and defers `close()` to the
+  confirmed `STATE_DISCONNECTED` callback (`handleDisconnected()`), with a
+  bounded `DISCONNECT_CLOSE_TIMEOUT_MS` (2s) fallback so the GATT client is
+  never leaked if that callback never arrives — closing synchronously
+  before the stack confirms teardown was found to break the *next*
+  `connectGatt()` (fixed 2026-09-19; see git history). Discovery
+  (`connectToHeartRateDevice()`) tries a known device first — the
+  remembered address, or a bonded cached-UUID match — with a bounded
+  `DIRECT_CONNECT_TIMEOUT_MS` (5s) probe (`tryDirectConnect()`), and only
+  falls back to scanning if there's no known device or the probe times
+  out. Scanning gathers *all* HR-capable candidates seen within a short
+  `DEVICE_COLLECTION_GRACE_MS` window after the first hit, instead of
+  grabbing the first one; if more than one candidate is found (from either
+  path), `MainActivity` shows a device picker
+  (`ConnectionState.AWAITING_DEVICE_SELECTION`, `discoveredDevices`,
+  `selectDevice()`/`cancelDeviceSelection()` on the service). The chosen
+  device's address is remembered via `UserSettings.saveRememberedDeviceAddress`
+  and short-circuits discovery entirely on future sessions — a runtime user
+  choice, not a hardcoded MAC, so this doesn't conflict with the "don't
+  hardcode a MAC or device name" rule under "Device discovery" below. This
+  known-device-first order (flipped from an earlier scan-first version,
+  2026-09-19) matters because a device already link-layer connected to
+  another app (e.g. Google Health) stops advertising, so scan-first could
+  waste a full scan timeout on a device that's actually reachable — see
+  "Device discovery" below for the hardware-confirmed reasoning.
 - `HeartRateZones` — Karvonen/Tanaka fractional zone calculation (pure,
   unit-tested). `UserSettings` persists age/resting HR via SharedPreferences;
   `MainActivity` shows a first-run setup screen that gates the main screen
@@ -249,6 +274,12 @@ Google Health uses to sync. Breaking it forces a full re-pair of the tracker.
     - UNVERIFIED: whether the Air still advertises to already-bonded peers with
       the toggle off. If it does, reconnect works either way. Test before relying
       on either behaviour.
+    - **Confirmed (2026-09-19), related but distinct:** the Air also stops
+      advertising with the toggle **on**, once *any* app (Google Health
+      included) already holds a GATT connection to it — advertising and
+      "connectable at all" aren't the same thing. See "Device discovery"
+      step 3 for the direct-connect-to-remembered-address fallback this
+      requires.
 - The Air appears in Google Health as connected equipment once we subscribe to
   the CCCD — not on connect alone.
 - Normal Google Health syncing continues while we are connected. Verified.
@@ -277,16 +308,55 @@ Do not hardcode a MAC or a device name — the app supports any BLE peripheral
 that serves the standard Heart Rate service (0x180D), not just the Fitbit
 Air. This is deliberate: the app is distributed publicly (see
 "Distribution" below) to people who may own a different HR-capable
-tracker. Resolve in this order:
+tracker, and possibly more than one at once. Resolve in this order:
 
-1. `BluetoothAdapter.getBondedDevices()`, fast-path match on a bonded device
-   whose OS-cached UUID list (`BluetoothDevice.getUuids()`) already includes
-   `0x180D`. This is a soft optimization, not a guarantee — like the GATT
-   service cache described below, this list can be stale or empty for a
-   device that supports the service but hasn't had it cached yet.
-2. Fall back to a `ScanFilter` on service UUID `0x180D`. This is the
+1. **Try a known device first, before ever scanning** (`knownDeviceCandidate()`
+   in `BleHeartRateService.kt`). The strongest signal is a remembered device
+   address (`UserSettings.loadRememberedDeviceAddress`) from a prior
+   successful connection — if present, connect directly to it via
+   `BluetoothAdapter.getRemoteDevice()`, bypassing discovery entirely.
+   Otherwise, fall back to bonded devices whose OS-cached UUID list
+   (`BluetoothDevice.getUuids()`) already includes `0x180D` — a soft
+   optimization, not a guarantee (like the GATT service cache described
+   below, this list can be stale or empty for a device that supports the
+   service but hasn't had it cached yet).
+2. This direct attempt (`tryDirectConnect()`) is bounded by
+   `DIRECT_CONNECT_TIMEOUT_MS` (5s) rather than the normal
+   reconnect-with-backoff schedule, since at this point we don't yet know
+   whether the device is even present — a fast, cleanly-aborted probe, not
+   a long retry loop.
+3. Only if there's no known device, or the direct attempt times out, fall
+   back to a `ScanFilter` on service UUID `0x180D`, collecting every unique
+   device seen (with a short grace window after the first hit so siblings
+   aren't missed — see `DEVICE_COLLECTION_GRACE_MS`). This is the
    authoritative, device-agnostic path and works for any HR peripheral
-   regardless of bond state or name.
+   regardless of bond state or name — needed for a first-ever device, a
+   replacement tracker, or a second device brought into range.
+4. Whichever step produced multiple candidates, `resolveDevice()` picks one:
+   the remembered device wins silently if present among them; a lone
+   candidate is auto-picked (and remembered); otherwise `MainActivity`
+   shows a picker and the user's choice is remembered for next time. This
+   remembered address is a runtime user preference persisted via
+   `UserSettings`, not a hardcoded value in source — it doesn't conflict
+   with the "no hardcoded MAC/name" rule above.
+
+**Why known-device-first, not scan-first (confirmed on hardware,
+2026-09-19):** once Google Health has an active connection to the Air, its
+own GATT client stays registered continuously (verified via `dumpsys
+bluetooth_manager`'s GATT Client Map), so the Air stops sending fresh
+advertisements — a scan can legitimately run its full timeout and find zero
+results even though the device is present, reachable, and "Always visible"
+is on, because the underlying ACL link to it just never dropped. A bonded
+device doesn't need to be discovered via scan to connect: `connectGatt()`
+attaches to an existing link directly. Scanning first (the original design)
+meant every session paid an 8s scan-timeout tax before falling back to a
+direct attempt; trying the known device first means the common case
+(same device, link still up) connects in a couple of seconds with no scan
+at all, and only a first-ever/new/different device pays the scan cost. This
+was the actual root cause of a real bug where session 2 (immediately after
+"End session") failed to connect while Google Health still showed the
+tracker connected — not a scan-timing issue, but the peripheral correctly
+not re-advertising while another app already held the link.
 
 The Fitbit Air specifically requires Google Health's "Always visible" toggle
 to be on before it will advertise (see "Connection constraints" below) —
