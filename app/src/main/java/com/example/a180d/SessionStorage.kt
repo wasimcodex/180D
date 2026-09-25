@@ -39,6 +39,24 @@ data class SessionEntity(
 
 data class SessionSummary(val session: SessionEntity, val stats: SessionStats?)
 
+/**
+ * The user-supplied title, or blank if there is none.
+ *
+ * Sessions saved before a blank title could be stored got a synthetic
+ * "Session <date>" label written into the row. That just restates the date the
+ * UI already shows beside it, so it reads as untitled — and since there is no
+ * rename affordance, the only place to undo it is at display time. Best-effort:
+ * it is matched against the format the device's *current* locale produces.
+ */
+val SessionEntity.userTitle: String
+    get() {
+        val trimmed = title.trim()
+        return if (trimmed == legacyDefaultTitle(startedAtMs)) "" else trimmed
+    }
+
+private fun legacyDefaultTitle(startedAtMs: Long): String =
+    "Session ${SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(startedAtMs))}"
+
 @Entity(
     tableName = "heart_rate_samples",
     foreignKeys = [
@@ -178,8 +196,9 @@ class SessionRepository(context: Context) {
     suspend fun savePendingSession(title: String) {
         val session = _pendingSession.value ?: return
         _pendingSession.value = null
-        val finalTitle = title.trim().ifBlank { defaultTitle(session.startedAtMs) }
-        database.sessionDao().update(session.copy(title = finalTitle))
+        // A blank title is stored as-is; the listings and the detail screen derive
+        // a date-based label at display time rather than baking one into the row.
+        database.sessionDao().update(session.copy(title = title.trim()))
     }
 
     suspend fun deleteSession(session: SessionEntity) {
@@ -215,10 +234,5 @@ class SessionRepository(context: Context) {
 
     companion object {
         private const val SAMPLE_BATCH_SIZE = 10
-
-        private fun defaultTitle(startedAtMs: Long): String {
-            val formatter = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
-            return "Session ${formatter.format(Date(startedAtMs))}"
-        }
     }
 }

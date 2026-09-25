@@ -18,6 +18,7 @@ import android.os.IBinder
 import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
@@ -103,6 +104,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -352,7 +354,14 @@ private fun ZoneSetupScreenPreview() {
     }
 }
 
-/** Hosts the drawer (profile + session history) and swaps in the session-detail screen when a row is tapped. */
+/**
+ * Hosts the drawer (profile + a session-history shortcut table) and the two
+ * screens it can push: the full session-history list and a single session's
+ * detail. `selectedSession` sits "above" `showHistory` rather than replacing
+ * it, so backing out of a detail screen lands wherever the user opened it
+ * from — the history page if they came via the menu entry, the main screen if
+ * they tapped a row in the drawer table.
+ */
 @Composable
 private fun AppRoot(
     service: BleHeartRateService?,
@@ -374,46 +383,63 @@ private fun AppRoot(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     var selectedSession by remember { mutableStateOf<SessionEntity?>(null) }
+    var showHistory by remember { mutableStateOf(false) }
     var showEditProfile by remember { mutableStateOf(false) }
 
     val session = selectedSession
-    if (session != null) {
-        SessionDetailScreen(
+    when {
+        session != null -> SessionDetailScreen(
             session = session,
             repository = historyRepository,
             zoneSettings = zoneSettings,
             onBack = { selectedSession = null },
         )
-    } else {
-        ModalNavigationDrawer(
-            drawerState = drawerState,
-            drawerContent = {
-                AppDrawerContent(
+
+        showHistory -> SessionHistoryScreen(
+            repository = historyRepository,
+            zoneSettings = zoneSettings,
+            onSessionClick = { selectedSession = it },
+            onBack = { showHistory = false },
+        )
+
+        else -> {
+            // Back closes an open drawer; with it closed no handler is enabled,
+            // so back still exits the app from the main screen.
+            BackHandler(enabled = drawerState.isOpen) { scope.launch { drawerState.close() } }
+            ModalNavigationDrawer(
+                drawerState = drawerState,
+                drawerContent = {
+                    AppDrawerContent(
+                        zoneSettings = zoneSettings,
+                        repository = historyRepository,
+                        onEditProfile = { showEditProfile = true },
+                        onOpenHistory = {
+                            showHistory = true
+                            scope.launch { drawerState.close() }
+                        },
+                        onSessionClick = {
+                            selectedSession = it
+                            scope.launch { drawerState.close() }
+                        },
+                        onClose = { scope.launch { drawerState.close() } },
+                        bubbleEnabled = bubbleEnabled,
+                        bubbleNeedsPermission = bubbleNeedsPermission,
+                        onToggleBubble = onToggleBubble,
+                        themeMode = themeMode,
+                        onThemeModeChange = onThemeModeChange,
+                    )
+                },
+            ) {
+                HeartRateScreen(
+                    service = service,
                     zoneSettings = zoneSettings,
-                    repository = historyRepository,
-                    onEditProfile = { showEditProfile = true },
-                    onSessionClick = {
-                        selectedSession = it
-                        scope.launch { drawerState.close() }
-                    },
-                    onClose = { scope.launch { drawerState.close() } },
-                    bubbleEnabled = bubbleEnabled,
-                    bubbleNeedsPermission = bubbleNeedsPermission,
-                    onToggleBubble = onToggleBubble,
-                    themeMode = themeMode,
-                    onThemeModeChange = onThemeModeChange,
+                    onStartSession = onStartSession,
+                    onEndSession = onEndSession,
+                    keepScreenOnEnabled = keepScreenOnEnabled,
+                    onToggleKeepScreenOn = onToggleKeepScreenOn,
+                    onOpenMenu = { scope.launch { drawerState.open() } },
                 )
-            },
-        ) {
-            HeartRateScreen(
-                service = service,
-                zoneSettings = zoneSettings,
-                onStartSession = onStartSession,
-                onEndSession = onEndSession,
-                keepScreenOnEnabled = keepScreenOnEnabled,
-                onToggleKeepScreenOn = onToggleKeepScreenOn,
-                onOpenMenu = { scope.launch { drawerState.open() } },
-            )
+            }
         }
     }
 
@@ -1366,6 +1392,18 @@ private fun ChevronLeftGlyph(tint: Color, modifier: Modifier = Modifier.size(18.
 }
 
 @Composable
+private fun ChevronRightGlyph(tint: Color, modifier: Modifier = Modifier.size(18.dp)) {
+    Canvas(modifier = modifier) {
+        val path = Path().apply {
+            moveTo(size.width * 0.38f, size.height * 0.1f)
+            lineTo(size.width * 0.7f, size.height * 0.5f)
+            lineTo(size.width * 0.38f, size.height * 0.9f)
+        }
+        drawPath(path, tint, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+@Composable
 private fun ClockGlyph(tint: Color, modifier: Modifier = Modifier.size(14.dp)) {
     Canvas(modifier = modifier) {
         val strokeWidth = 1.6.dp.toPx()
@@ -1629,6 +1667,7 @@ private fun AppDrawerContent(
     zoneSettings: ZoneSettings,
     repository: SessionRepository,
     onEditProfile: () -> Unit,
+    onOpenHistory: () -> Unit,
     onSessionClick: (SessionEntity) -> Unit,
     onClose: () -> Unit,
     bubbleEnabled: Boolean,
@@ -1703,12 +1742,25 @@ private fun AppDrawerContent(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                 Spacer(Modifier.height(16.dp))
 
-                Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text(
-                    text = if (summaries.isEmpty()) "No sessions yet" else "${summaries.size} sessions logged",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onOpenHistory)
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column {
+                        Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = sessionCountLabel(summaries.size),
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
+                        )
+                    }
+                    ChevronRightGlyph(tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f))
+                }
                 Spacer(Modifier.height(10.dp))
 
                 if (summaries.isEmpty()) {
@@ -1758,10 +1810,10 @@ private fun ProfileRow(label: String, value: String, onEdit: () -> Unit) {
 @Composable
 private fun SessionTableHeader() {
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Text("DATE", modifier = Modifier.weight(1.5f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
-        Text("DURATION", modifier = Modifier.weight(1.1f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
-        Text("AVG", modifier = Modifier.weight(0.7f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
-        Text("ZONE", modifier = Modifier.weight(0.65f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("SESSION", modifier = Modifier.weight(2f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("DURATION", modifier = Modifier.weight(0.85f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("AVG", modifier = Modifier.weight(0.6f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+        Text("ZONE", modifier = Modifier.weight(0.6f), fontSize = 10.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
     }
 }
 
@@ -1769,6 +1821,8 @@ private fun SessionTableHeader() {
 private fun SessionTableRow(summary: SessionSummary, zoneSettings: ZoneSettings, onClick: () -> Unit) {
     val dateFormat = remember { SimpleDateFormat("MMM d", Locale.getDefault()) }
     val timeFormat = remember { SimpleDateFormat("h:mm a", Locale.getDefault()) }
+    val started = remember(summary.session.startedAtMs) { Date(summary.session.startedAtMs) }
+    val title = summary.session.userTitle
     val avgBpm = summary.stats?.avgBpm?.roundToInt()
     val avgZone = avgBpm?.let { HeartRateZones.computeZone(it, zoneSettings.age, zoneSettings.restingHr) }
     val zoneIndex = zoneSegmentIndex(avgZone)
@@ -1778,25 +1832,44 @@ private fun SessionTableRow(summary: SessionSummary, zoneSettings: ZoneSettings,
             modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(Modifier.weight(1.5f)) {
-                Text(dateFormat.format(Date(summary.session.startedAtMs)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(timeFormat.format(Date(summary.session.startedAtMs)), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+            // A titled session leads with its title and keeps the date beneath;
+            // an untitled one (blank title) falls back to date over time.
+            Column(Modifier.weight(2f).padding(end = 10.dp)) {
+                if (title.isNotEmpty()) {
+                    Text(
+                        title,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${dateFormat.format(started)} · ${timeFormat.format(started)}",
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f),
+                    )
+                } else {
+                    Text(dateFormat.format(started), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(timeFormat.format(started), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f))
+                }
             }
             Text(
                 formatDuration(summary.session.endedAtMs - summary.session.startedAtMs),
-                modifier = Modifier.weight(1.1f),
+                modifier = Modifier.weight(0.85f),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
             )
             Text(
                 avgBpm?.toString() ?: "--",
-                modifier = Modifier.weight(0.7f),
+                modifier = Modifier.weight(0.6f),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
             )
-            Box(Modifier.weight(0.65f)) {
+            Box(Modifier.weight(0.6f)) {
                 if (zoneIndex >= 0) {
                     ZoneChip(index = zoneIndex, label = "Z${zoneIndex + 1}")
                 } else {
@@ -1892,6 +1965,72 @@ private fun EditProfileDialog(current: ZoneSettings, onDismiss: () -> Unit, onSa
     )
 }
 
+// ---- Session history: the full list, reached from the side menu ----
+
+private fun sessionCountLabel(count: Int): String = when (count) {
+    0 -> "No sessions yet"
+    1 -> "1 session logged"
+    else -> "$count sessions logged"
+}
+
+/**
+ * Full-screen list of every saved session. Shares [SessionRepository.sessionSummaries]
+ * and the [SessionTableHeader]/[SessionTableRow] pair with the drawer's shortcut
+ * table, so the two views can never drift apart.
+ */
+@Composable
+private fun SessionHistoryScreen(
+    repository: SessionRepository,
+    zoneSettings: ZoneSettings,
+    onSessionClick: (SessionEntity) -> Unit,
+    onBack: () -> Unit,
+) {
+    val summaries by repository.sessionSummaries.collectAsStateWithLifecycle(initialValue = emptyList())
+
+    BackHandler(onBack = onBack)
+
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SquareIconButton(onClick = onBack) { ChevronLeftGlyph(tint = MaterialTheme.colorScheme.onSurface) }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Session History", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    sessionCountLabel(summaries.size),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                )
+            }
+            // Balances the back button so the title stays optically centred.
+            Spacer(Modifier.size(44.dp))
+        }
+
+        if (summaries.isEmpty()) {
+            Box(Modifier.fillMaxSize().padding(horizontal = 40.dp), contentAlignment = Alignment.Center) {
+                Text(
+                    "Sessions you save will show up here as a table.",
+                    fontSize = 14.sp,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+            ) {
+                item { SessionTableHeader() }
+                items(summaries, key = { it.session.id }) { summary ->
+                    SessionTableRow(summary = summary, zoneSettings = zoneSettings, onClick = { onSessionClick(summary.session) })
+                }
+                item { Spacer(Modifier.height(16.dp)) }
+            }
+        }
+    }
+}
+
 // ---- Session detail: full graph + time-in-zone ----
 
 @Composable
@@ -1912,6 +2051,10 @@ private fun SessionDetailScreen(
         samples = repository.samplesForSession(session.id)
     }
 
+    // The delete-confirm AlertDialog is its own window and consumes back itself,
+    // so this only fires for the screen underneath it.
+    BackHandler(onBack = onBack)
+
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
@@ -1919,8 +2062,8 @@ private fun SessionDetailScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SquareIconButton(onClick = onBack) { ChevronLeftGlyph(tint = MaterialTheme.colorScheme.onSurface) }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(session.title.ifBlank { "Session" }, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Column(modifier = Modifier.padding(horizontal = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(session.userTitle.ifBlank { "Session" }, fontSize = 15.sp, fontWeight = FontWeight.Bold)
                 Text(formatSessionSubtitle(session), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
             }
             SquareIconButton(onClick = { scope.launch { shareCsv(context, repository.exportCsv(session)) } }) {

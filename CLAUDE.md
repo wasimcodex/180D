@@ -95,10 +95,28 @@ is needed for Compose. Implemented so far:
   `pendingSession` and `MainActivity` shows a blocking (no dismiss-by-outside-tap)
   save-or-discard dialog with an optional title field; discard deletes the
   row (cascade-deletes its samples via the FK), save just sets the title.
+  An untitled session stores a **blank** title — don't reintroduce a
+  synthetic "Session <date>" default, because both listings lead with the
+  title and that default just restates the date printed beneath it. Rows
+  written before that rule existed still carry one, and there is no rename
+  affordance to undo it, so `SessionEntity.userTitle` reproduces the old
+  format and reports a match as untitled; every read of a title for display
+  goes through it, never through `.title` directly.
   A zero-sample session (tapped Start then End before any data arrived) is
-  deleted automatically with no prompt. A "Session history" screen lists
-  saved sessions with per-session CSV export (`FileProvider`, `Intent.ACTION_SEND`)
-  and delete. Uses KSP for Room's annotation processing — see "Room + KSP"
+  deleted automatically with no prompt. Browsing saved sessions is three
+  surfaces, not one: the side menu carries a shortcut table, its tappable
+  "Session History" header opens the full-screen `SessionHistoryScreen` list,
+  and tapping any row (from either) opens `SessionDetailScreen` — the graph,
+  time-in-zone breakdown, per-session CSV export (`FileProvider`,
+  `Intent.ACTION_SEND`) and delete all live on the *detail* screen. Both list
+  views collect the same `SessionRepository.sessionSummaries` flow and render
+  the same `SessionTableRow`, so they can't drift; a titled row reads title
+  over "MMM d · h:mm a", an untitled one date over time. Navigation is two `remember`ed flags in `AppRoot`
+  (`selectedSession` layered over `showHistory`) rather than a nav library,
+  which is what makes back out of a detail screen land where the user opened
+  it from; `BackHandler` is wired on both pushed screens and on the open
+  drawer, so system back only exits the app from the idle main screen.
+  Uses KSP for Room's annotation processing — see "Room + KSP"
   under Build & tooling for a real gotcha this hit.
 - Floating bubble: an **opt-in** `TYPE_APPLICATION_OVERLAY` pill showing live
   BPM over other apps (`BubbleController.kt`, `BubbleView.kt`,
