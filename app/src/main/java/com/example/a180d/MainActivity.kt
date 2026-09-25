@@ -3,6 +3,7 @@ package com.example.a180d
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.ComponentName
 import android.content.Context
@@ -14,12 +15,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -100,6 +103,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -131,6 +135,7 @@ class MainActivity : ComponentActivity() {
     private val userSettings by lazy { UserSettings(this) }
     private var boundService by mutableStateOf<BleHeartRateService?>(null)
 
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             boundService = (binder as BleHeartRateService.LocalBinder).service
@@ -146,8 +151,24 @@ class MainActivity : ComponentActivity() {
         if (results.values.all { it }) startSession()
     }
 
+    private var bubbleEnabled by mutableStateOf(false)
+    private var bubbleNeedsPermission by mutableStateOf(false)
+
+    private val overlayPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        // ACTION_MANAGE_OVERLAY_PERMISSION always reports RESULT_CANCELED, so the
+        // result code says nothing — ask the system what actually happened.
+        if (Settings.canDrawOverlays(this)) {
+            applyBubbleEnabled(true)
+        } else {
+            bubbleNeedsPermission = true
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        reconcileBubblePermission()
         setContent {
             var themeMode by remember { mutableStateOf(userSettings.loadThemeMode()) }
             AppTheme(themeMode = themeMode) {
@@ -175,6 +196,9 @@ class MainActivity : ComponentActivity() {
                                 keepScreenOnEnabled = !keepScreenOnEnabled
                                 userSettings.saveKeepScreenOn(keepScreenOnEnabled)
                             },
+                            bubbleEnabled = bubbleEnabled,
+                            bubbleNeedsPermission = bubbleNeedsPermission,
+                            onToggleBubble = ::toggleBubble,
                             themeMode = themeMode,
                             onThemeModeChange = { mode ->
                                 userSettings.saveThemeMode(mode)
@@ -201,6 +225,44 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         bindService(Intent(this, BleHeartRateService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
+        // The user can revoke "Display over other apps" from system settings at
+        // any time; reconcile so the toggle never claims to be on when the
+        // bubble physically cannot appear.
+        reconcileBubblePermission()
+    }
+
+    /** Turns the stored opt-in back off if the overlay permission has since been revoked. */
+    private fun reconcileBubblePermission() {
+        val granted = Settings.canDrawOverlays(this)
+        val stored = userSettings.loadBubbleEnabled()
+        if (stored && !granted) {
+            applyBubbleEnabled(false)
+            bubbleNeedsPermission = true
+        } else {
+            bubbleEnabled = stored && granted
+            bubbleNeedsPermission = false
+        }
+    }
+
+    private fun toggleBubble() {
+        when {
+            bubbleEnabled -> applyBubbleEnabled(false)
+            Settings.canDrawOverlays(this) -> applyBubbleEnabled(true)
+            else -> overlayPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.fromParts("package", packageName, null),
+                ),
+            )
+        }
+    }
+
+    private fun applyBubbleEnabled(enabled: Boolean) {
+        bubbleEnabled = enabled
+        bubbleNeedsPermission = false
+        userSettings.saveBubbleEnabled(enabled)
+        // Take effect mid-session too, not just on the next one.
+        boundService?.setBubbleEnabled(enabled)
     }
 
     override fun onStop() {
@@ -282,6 +344,14 @@ private fun ZoneSetupScreen(onSave: (ZoneSettings) -> Unit) {
     }
 }
 
+@Composable
+@Preview
+private fun ZoneSetupScreenPreview() {
+    AppTheme {
+        ZoneSetupScreen(onSave = {})
+    }
+}
+
 /** Hosts the drawer (profile + session history) and swaps in the session-detail screen when a row is tapped. */
 @Composable
 private fun AppRoot(
@@ -293,6 +363,9 @@ private fun AppRoot(
     onEndSession: () -> Unit,
     keepScreenOnEnabled: Boolean,
     onToggleKeepScreenOn: () -> Unit,
+    bubbleEnabled: Boolean,
+    bubbleNeedsPermission: Boolean,
+    onToggleBubble: () -> Unit,
     themeMode: ThemeMode,
     onThemeModeChange: (ThemeMode) -> Unit,
 ) {
@@ -324,6 +397,9 @@ private fun AppRoot(
                         scope.launch { drawerState.close() }
                     },
                     onClose = { scope.launch { drawerState.close() } },
+                    bubbleEnabled = bubbleEnabled,
+                    bubbleNeedsPermission = bubbleNeedsPermission,
+                    onToggleBubble = onToggleBubble,
                     themeMode = themeMode,
                     onThemeModeChange = onThemeModeChange,
                 )
@@ -464,6 +540,24 @@ private fun HeartRateScreen(
 }
 
 @Composable
+@Preview
+private fun HeartRateScreenPreview() {
+    // service = null makes HeartRateScreen fall back to its EMPTY_*_FLOW
+    // constants, so this renders the disconnected/idle state.
+    AppTheme {
+        HeartRateScreen(
+            service = null,
+            zoneSettings = ZoneSettings(age = 30, restingHr = 60),
+            onStartSession = {},
+            onEndSession = {},
+            keepScreenOnEnabled = false,
+            onToggleKeepScreenOn = {},
+            onOpenMenu = {},
+        )
+    }
+}
+
+@Composable
 private fun HeartRatePortraitBody(
     sample: HeartRateSample?,
     zone: Double?,
@@ -512,6 +606,34 @@ private fun HeartRatePortraitBody(
 
         Box(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 30.dp)) {
             SessionActionButton(active = sessionActive, onClick = if (sessionActive) onEndSession else onStartSession)
+        }
+    }
+}
+
+/** Fake trend data so preview charts have something to draw — real samples come from [BleHeartRateService]. */
+private fun previewRecentSamples(): List<HeartRateSample> {
+    val now = System.currentTimeMillis()
+    return List(30) { i -> HeartRateSample(bpm = 110 + (i % 15) * 2, timestampMs = now - (30 - i) * 1_000L) }
+}
+
+@Composable
+@Preview(showBackground = true)
+private fun HeartRatePortraitBodyPreview() {
+    AppTheme {
+        Surface(color = MaterialTheme.colorScheme.background) {
+            HeartRatePortraitBody(
+                sample = HeartRateSample(bpm = 142, timestampMs = System.currentTimeMillis()),
+                zone = 3.4,
+                isStale = false,
+                ageMs = 800L,
+                elapsedText = "12:34",
+                error = null,
+                recentSamples = previewRecentSamples(),
+                zoneSettings = ZoneSettings(age = 30, restingHr = 60),
+                sessionActive = true,
+                onStartSession = {},
+                onEndSession = {},
+            )
         }
     }
 }
@@ -573,6 +695,28 @@ private fun HeartRateLandscapeBody(
             Spacer(Modifier.height(20.dp))
 
             SessionActionButton(active = sessionActive, onClick = if (sessionActive) onEndSession else onStartSession)
+        }
+    }
+}
+
+@Composable
+@Preview(showBackground = true, widthDp = 640, heightDp = 360)
+private fun HeartRateLandscapeBodyPreview() {
+    AppTheme {
+        Surface(color = MaterialTheme.colorScheme.background) {
+            HeartRateLandscapeBody(
+                sample = HeartRateSample(bpm = 142, timestampMs = System.currentTimeMillis()),
+                zone = 3.4,
+                isStale = false,
+                ageMs = 800L,
+                elapsedText = "12:34",
+                error = null,
+                recentSamples = previewRecentSamples(),
+                zoneSettings = ZoneSettings(age = 30, restingHr = 60),
+                sessionActive = true,
+                onStartSession = {},
+                onEndSession = {},
+            )
         }
     }
 }
@@ -651,34 +795,13 @@ private fun ConnectionState.isInProgress(): Boolean = this == ConnectionState.SC
     this == ConnectionState.DISCOVERING ||
     this == ConnectionState.RECONNECTING
 
-private val ZONE_COLORS = listOf(
-    Color(0xFF4FC3F7), // Zone 1
-    Color(0xFF66BB6A), // Zone 2
-    Color(0xFFFFEE58), // Zone 3
-    Color(0xFFFFA726), // Zone 4
-    Color(0xFFEF5350), // Zone 5
-)
+// The zone palette and the zone -> index mapping live in ZoneColors.kt as plain
+// ARGB ints, shared with the floating bubble (which draws on a raw Canvas and
+// so cannot use Compose's Color). These are the Compose-side wrappers.
+private val ZONE_COLORS = ZONE_COLOR_ARGB.map { Color(it) }
+private val ZONE_CHIP_TEXT_LIGHT = ZONE_CHIP_TEXT_LIGHT_ARGB.map { Color(it) }
 
-/** Deepened per-zone colors for text sitting on a light background, where the raw zone hue (esp. yellow) is too washed out to read. */
-private val ZONE_CHIP_TEXT_LIGHT = listOf(
-    Color(0xFF0288D1),
-    Color(0xFF2E7D32),
-    Color(0xFF8D6E00),
-    Color(0xFFE65100),
-    Color(0xFFC62828),
-)
-
-/** -1 when there's no reading yet; otherwise 0..4 into [ZONE_COLORS], using the same fraction-of-arc mapping as the dial's marker. */
-private fun zoneSegmentIndex(zone: Double?): Int {
-    if (zone == null) return -1
-    val fraction = ((zone - 1.0) / 5.0).coerceIn(0.0, 1.0)
-    return (fraction * ZONE_COLORS.size).toInt().coerceIn(0, ZONE_COLORS.size - 1)
-}
-
-private fun zoneSegmentColor(zone: Double?): Color {
-    val index = zoneSegmentIndex(zone)
-    return if (index >= 0) ZONE_COLORS[index] else Color(0xFF9E9E9E)
-}
+private fun zoneSegmentColor(zone: Double?): Color = Color(zoneArgb(zone))
 
 @Composable
 private fun zoneChipTextColor(index: Int): Color =
@@ -805,6 +928,21 @@ private fun ZoneDial(bpm: Int?, zone: Double?, isStale: Boolean, modifier: Modif
             } else {
                 Text("Zone --", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.35f))
             }
+        }
+    }
+}
+
+@Composable
+@Preview(showBackground = true)
+private fun ZoneDialPreview() {
+    AppTheme {
+        Surface(color = MaterialTheme.colorScheme.background) {
+            ZoneDial(
+                bpm = 142,
+                zone = 3.4,
+                isStale = false,
+                modifier = Modifier.size(260.dp),
+            )
         }
     }
 }
@@ -1415,6 +1553,75 @@ private fun ThemeModeOption(
     }
 }
 
+/**
+ * Opt-in for the floating BPM overlay. The whole row is the touch target (the
+ * switch itself is only 28dp tall), which also gives the "tap to allow" state
+ * somewhere comfortable to be tapped.
+ */
+@Composable
+private fun BubbleToggleRow(enabled: Boolean, needsPermission: Boolean, onToggle: () -> Unit) {
+    val borderColor = if (needsPermission) {
+        MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+    } else {
+        MaterialTheme.colorScheme.outline
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, borderColor, RoundedCornerShape(20.dp))
+            .clickable { onToggle() }
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text("Show BPM over other apps", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (needsPermission) {
+                    "Permission needed \u2014 tap to allow drawing over other apps."
+                } else {
+                    "A small pill appears while a session is running and you're in another app."
+                },
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                color = if (needsPermission) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                },
+            )
+        }
+        ToggleSwitch(checked = enabled)
+    }
+}
+
+/** Purely visual — the enclosing row owns the click, so this never needs its own touch target. */
+@Composable
+private fun ToggleSwitch(checked: Boolean) {
+    val knobOffset by animateDpAsState(if (checked) 22.dp else 4.dp, label = "toggleKnob")
+    Box(
+        modifier = Modifier
+            .size(width = 46.dp, height = 28.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(if (checked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(999.dp)),
+    ) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .offset(x = knobOffset)
+                .size(20.dp)
+                .clip(CircleShape)
+                .background(
+                    if (checked) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                ),
+        )
+    }
+}
+
 // ---- Side menu: profile edit + session history table ----
 
 @Composable
@@ -1424,6 +1631,9 @@ private fun AppDrawerContent(
     onEditProfile: () -> Unit,
     onSessionClick: (SessionEntity) -> Unit,
     onClose: () -> Unit,
+    bubbleEnabled: Boolean,
+    bubbleNeedsPermission: Boolean,
+    onToggleBubble: () -> Unit,
     themeMode: ThemeMode,
     onThemeModeChange: (ThemeMode) -> Unit,
 ) {
@@ -1468,6 +1678,18 @@ private fun AppDrawerContent(
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                     ProfileRow(label = "RESTING HR", value = "${zoneSettings.restingHr} bpm", onEdit = onEditProfile)
                 }
+
+                Spacer(Modifier.height(20.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                Spacer(Modifier.height(16.dp))
+
+                Text("Floating Bubble", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                BubbleToggleRow(
+                    enabled = bubbleEnabled,
+                    needsPermission = bubbleNeedsPermission,
+                    onToggle = onToggleBubble,
+                )
 
                 Spacer(Modifier.height(20.dp))
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
@@ -1613,6 +1835,24 @@ private fun DevicePickerDialog(devices: List<BluetoothDevice>, onSelect: (Blueto
         confirmButton = {},
         dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
     )
+}
+
+@SuppressLint("MissingPermission")
+@Composable
+@Preview(showBackground = true)
+private fun DevicePickerDialogPreview() {
+    // BluetoothDevice has no public constructor; getRemoteDevice() just wraps
+    // a MAC address string and doesn't require a real paired/scanned device.
+    // If the preview sandbox can't provide a BluetoothAdapter, this degrades
+    // to an empty list rather than crashing the preview.
+    val adapter = BluetoothAdapter.getDefaultAdapter()
+    val devices = listOfNotNull(
+        adapter?.getRemoteDevice("AA:BB:CC:DD:EE:01"),
+        adapter?.getRemoteDevice("AA:BB:CC:DD:EE:02"),
+    )
+    AppTheme {
+        DevicePickerDialog(devices = devices, onSelect = {}, onCancel = {})
+    }
 }
 
 @Composable

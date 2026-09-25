@@ -110,11 +110,21 @@ class BleHeartRateService : Service() {
     private var deviceSelectionDeferred: CompletableDeferred<BluetoothDevice?>? = null
     private var probingDeferred: CompletableDeferred<Boolean>? = null
 
+    /** The opt-in floating BPM overlay. Hosted here rather than in a second service — see [BubbleController]. */
+    private lateinit var bubbleController: BubbleController
+
     override fun onCreate() {
         super.onCreate()
         bluetoothAdapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
         notificationManager = getSystemService(NotificationManager::class.java)
         createNotificationChannel()
+        bubbleController = BubbleController(
+            context = this,
+            userSettings = userSettings,
+            latestSample = latestSample,
+            connectionState = connectionState,
+            onTapped = { startActivity(BubbleController.launchAppIntent(this)) },
+        )
         serviceScope.launch {
             latestSample.collect { sample -> updateNotification(sample) }
         }
@@ -142,8 +152,14 @@ class BleHeartRateService : Service() {
 
     override fun onDestroy() {
         stopSession()
+        bubbleController.destroy()
         serviceScope.cancel()
         super.onDestroy()
+    }
+
+    /** Called through [LocalBinder] so the drawer toggle takes effect mid-session, not just on the next one. */
+    fun setBubbleEnabled(enabled: Boolean) {
+        bubbleController.setEnabled(enabled)
     }
 
     // ---- Session lifecycle -------------------------------------------------
@@ -163,6 +179,7 @@ class BleHeartRateService : Service() {
         backoffIndex = 0
         serviceScope.launch { sessionRepository.startSession(startMs) }
         serviceScope.launch { connectToHeartRateDevice() }
+        bubbleController.onSessionStarted()
     }
 
     @SuppressLint("MissingPermission")
@@ -193,6 +210,7 @@ class BleHeartRateService : Service() {
             }
         }
         serviceScope.launch { sessionRepository.endSession() }
+        bubbleController.onSessionEnded()
     }
 
     // ---- Device discovery ---------------------------------------------------

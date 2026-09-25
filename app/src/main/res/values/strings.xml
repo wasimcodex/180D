@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">180D</string>
+    <string name="bubble_dismissed">Bubble hidden until the next session</string>
+    <string name="bubble_reading">Heart rate %1$s beats per minute</string>
+    <string name="bubble_no_reading">Heart rate unavailable</string>
+    <string name="bubble_dismiss_label">Hide</string>
+    <string name="bubble_hide_action">Hide bubble</string>
 </resources>

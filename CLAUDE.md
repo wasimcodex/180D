@@ -46,7 +46,11 @@ is needed for Compose. Implemented so far:
   waste a full scan timeout on a device that's actually reachable — see
   "Device discovery" below for the hardware-confirmed reasoning.
 - `HeartRateZones` — Karvonen/Tanaka fractional zone calculation (pure,
-  unit-tested). `UserSettings` persists age/resting HR via SharedPreferences;
+  unit-tested). `ZoneColors.kt` holds the zone palette and the zone->index
+  mapping as plain ARGB ints (not Compose `Color`s) because the bubble draws
+  on a raw `Canvas` and `BubbleRenderState` must stay unit-testable off-device;
+  `MainActivity` wraps them back into `Color` for its own use.
+- `UserSettings` persists age/resting HR via SharedPreferences;
   `MainActivity` shows a first-run setup screen that gates the main screen
   until both are set, plus an edit affordance.
 - Notification: full 3-tier fallback implemented. Channel is
@@ -96,6 +100,41 @@ is needed for Compose. Implemented so far:
   saved sessions with per-session CSV export (`FileProvider`, `Intent.ACTION_SEND`)
   and delete. Uses KSP for Room's annotation processing — see "Room + KSP"
   under Build & tooling for a real gotcha this hit.
+- Floating bubble: an **opt-in** `TYPE_APPLICATION_OVERLAY` pill showing live
+  BPM over other apps (`BubbleController.kt`, `BubbleView.kt`,
+  `BubbleRenderState.kt`). Off by default; the drawer toggle sends the user
+  to `Settings.ACTION_MANAGE_OVERLAY_PERMISSION` and only flips on once
+  `canDrawOverlays()` returns true (that screen always reports
+  `RESULT_CANCELED`, so never read its result code). Shown only while a
+  session is live *and* the app is backgrounded — foreground state comes from
+  `ProcessLifecycleOwner` (`lifecycle-process`), chosen over an
+  onStart/onStop binder call because it debounces rotation so the bubble
+  doesn't flash. Drag to move (snaps to the nearer edge, position remembered
+  as an edge + y-fraction), tap to open the app, and drag onto the
+  bottom-of-screen dismiss target (`DismissTargetView.kt`) to hide it for the
+  session — the chat-head convention, which replaced an earlier long-press
+  (undiscoverable, and nothing about a floating overlay suggests it). Two
+  constraints that gesture imposes: the target window must be added **before**
+  the bubble, since two `TYPE_APPLICATION_OVERLAY` windows from one app stack
+  in add order with no public way to set z within a type — add it lazily on
+  drag start and the scrim renders over the bubble you're dragging; and it
+  must carry `FLAG_NOT_TOUCHABLE`, or it steals the drag stream from the
+  bubble mid-gesture. Because drag-to-target is pointer-only, the bubble also
+  carries a `ViewCompat.addAccessibilityAction` "Hide bubble" action —
+  without it a screen-reader user has no way to dismiss at all.
+  Hosted inside `BleHeartRateService` — no second service, and
+  an overlay needs no foreground-service type of its own; all `WindowManager`
+  calls are posted to the main thread because `serviceScope` is
+  `Dispatchers.Default`. Drawn as a plain `View` on `Canvas`, *not* a
+  `ComposeView`: that would need `ViewTreeLifecycleOwner` /
+  `ViewTreeSavedStateRegistryOwner` / `ViewTreeViewModelStoreOwner` installed
+  by hand for a pill, a ring and one text run. Two things to preserve if you
+  edit it: (1) the window's x/y are relative to the frame **inside** the
+  system bars (no `FLAG_LAYOUT_NO_LIMITS`), so positions are 0-origin —
+  adding the inset offsets counts them twice; (2) the controller drives taps
+  from its own touch listener, so it must route them through
+  `View.performClick()` or accessibility services cannot activate the bubble
+  at all.
 
 Not yet implemented: nothing from the original v1 feature list — remaining
 work is the local-network web server (not yet designed) and the unverified
@@ -387,6 +426,8 @@ Foreground service is **mandatory** — Android kills background BLE connections
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+<!-- Opt-in floating BPM bubble only; off by default. -->
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 ```
 
 Service type: `connectedDevice`.
@@ -417,6 +458,13 @@ believing it is current, and it will be wrong.
   dim the value, show the age, or show a disconnected state.
 - Never render a stale BPM as though it were current.
 - Never interpolate or hold the last value forward to smooth the display.
+
+The floating bubble goes further than the in-app dial: past 5s it **drops the
+digits entirely** (`--`, grey ring, hollow glyph, 35% alpha) rather than
+dimming them. At 84dp wide there is no room for an age label, so a faded number
+would be indistinguishable from a live one at a glance. The
+notification/Live Update surface still has no staleness check — see the
+definition-of-done list.
 
 ---
 
